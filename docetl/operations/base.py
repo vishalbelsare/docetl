@@ -2,7 +2,9 @@
 The BaseOperation class is an abstract base class for all operations in the docetl framework. It provides a common structure and interface for various data processing operations.
 """
 
+import traceback
 from abc import ABC, ABCMeta, abstractmethod
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -10,6 +12,29 @@ from rich.console import Console
 from rich.status import Status
 
 from docetl.console import DOCETL_CONSOLE
+
+
+class Cardinality(str, Enum):
+    """How an operation's output row count relates to its input row count.
+
+    ONE_TO_ONE is an *at-most* contract, not an exactness guarantee: the
+    operation intends one output per input, decides each row locally,
+    never inserts or reorders rows — but may still drop a row on a
+    per-row failure (an exhausted LLM timeout silently drops the row
+    today rather than raising). That is sufficient for selection swaps
+    (filter pushdown commutes with row-local drops: both orders keep
+    exactly the rows that pass the predicate AND survive the op) but NOT
+    for count- or position-sensitive rewrites like a positional head —
+    LimitPushdown documents the exactness assumption it accepts.
+    """
+
+    ONE_TO_ONE = "one_to_one"  # at most one output row per input row,
+    # decided row-locally; never inserts or reorders (see class docstring)
+    SELECTION = "selection"  # a subset of the input rows (any added
+    # annotation fields show up in fields_written)
+    MANY_TO_ONE = "many_to_one"  # group-by style aggregation
+    ONE_TO_MANY = "one_to_many"  # each input row expands to >= 0 rows
+    MANY_TO_MANY = "many_to_many"  # anything else / unknown
 
 
 class GleaningConfig(BaseModel):
@@ -87,6 +112,80 @@ class BaseOperation(ABC, metaclass=BaseOperationMeta):
         type: str
         skip_on_error: bool = False
         gleaning: GleaningConfig | None = None
+        retriever: str | None = None
+
+    @classmethod
+    def transform_schema(
+        cls, schema: dict[str, str], config: dict[str, Any]
+    ) -> dict[str, str]:
+        """Return the output schema after this operation runs on rows
+        with *schema*, given its *config*.
+
+        Best-effort and purely static — used for inspection (e.g.
+        ``Frame.schema()``) without executing anything. The default merges
+        the operation's declared ``output.schema`` and applies
+        ``drop_keys``; operations with structural effects (split, unnest,
+        gather, extract, ...) override this to declare the keys they add
+        or reshape.
+        """
+        result = dict(schema)
+        output_schema = (config.get("output") or {}).get("schema") or {}
+        if isinstance(output_schema, dict):
+            result.update(output_schema)
+        for key in config.get("drop_keys") or []:
+            result.pop(key, None)
+        return result
+
+    # ── plan traits ────────────────────────────────────────────────
+    # Static, config-dependent semantics consumed by docetl.plan for
+    # validation and equivalence-preserving rewrites. Like
+    # transform_schema, these are classmethods so they work without
+    # instantiating (and thus without executing) anything. The defaults
+    # are maximally conservative: an operation that doesn't override
+    # them can never qualify for a rewrite. Overrides must stay sound —
+    # when a trait can't be determined from the config, return the
+    # unknown/conservative value, never a guess.
+
+    @classmethod
+    def cardinality(cls, config: dict[str, Any]) -> Cardinality:
+        """Output-vs-input row count relationship for this config."""
+        return Cardinality.MANY_TO_MANY
+
+    @classmethod
+    def fields_read(cls, config: dict[str, Any]) -> "frozenset[str] | None":
+        """Input fields this operation reads, or None if unknown (treat as
+        the whole row)."""
+        return None
+
+    @classmethod
+    def fields_written(cls, config: dict[str, Any]) -> "frozenset[str] | None":
+        """Fields this operation adds, overwrites, or removes (``drop_keys``
+        count), or None if unknown (treat as possibly any field)."""
+        return None
+
+    @classmethod
+    def fields_removed(cls, config: dict[str, Any]) -> "frozenset[str]":
+        """Fields this operation *definitely* removes from every row it
+        emits (``drop_keys``, a filter's popped decision key). Used for
+        the only sound missing-field check in an open world: reading a
+        field that was definitely removed upstream."""
+        return frozenset(config.get("drop_keys") or [])
+
+    @classmethod
+    def is_llm(cls, config: dict[str, Any]) -> bool:
+        """Whether executing this config costs LLM calls."""
+        return False
+
+    @classmethod
+    def is_row_local(cls, config: dict[str, Any]) -> bool:
+        """Whether each output row depends only on its own input row
+        (plus static config/external services keyed on that row)."""
+        return False
+
+    @classmethod
+    def preserves_order(cls, config: dict[str, Any]) -> bool:
+        """Whether output rows appear in input-row order."""
+        return False
 
     @abstractmethod
     def execute(self, input_data: list[dict]) -> tuple[list[dict], float]:
@@ -109,3 +208,26 @@ class BaseOperation(ABC, metaclass=BaseOperationMeta):
         """Perform syntax checks on the operation configuration."""
         # Validate the configuration using Pydantic
         self.schema.model_validate(self.config, context=context)
+
+    def _maybe_build_retrieval_context(self, context: dict[str, Any]) -> str:
+        """Build retrieval context string if a retriever is configured."""
+        retriever_name = self.config.get("retriever")
+        if not retriever_name:
+            return ""
+        retrievers = getattr(self.runner, "retrievers", {})
+        if retriever_name not in retrievers:
+            raise ValueError(
+                f"Retriever '{retriever_name}' not found in configuration."
+            )
+        retriever = retrievers[retriever_name]
+        try:
+            result = retriever.retrieve(context)
+            return result.rendered_context or ""
+        except Exception as e:
+            # Soft-fail to avoid blocking the op
+            self.console.log(
+                f"[yellow]Warning: retrieval failed for '{retriever_name}': {e}[/yellow]"
+            )
+            # Print traceback to help debug
+            self.console.log(traceback.format_exc())
+            return "No extra context available."

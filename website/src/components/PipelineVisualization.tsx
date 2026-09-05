@@ -49,6 +49,7 @@ const opTypeToDocLink = {
   map: "https://ucbepic.github.io/docetl/operators/map/",
   reduce: "https://ucbepic.github.io/docetl/operators/reduce/",
   unnest: "https://ucbepic.github.io/docetl/operators/unnest/",
+  unnest_columns: "https://ucbepic.github.io/docetl/operators/unnest/",
   resolve: "https://ucbepic.github.io/docetl/operators/resolve/",
 };
 
@@ -460,11 +461,11 @@ const PipelineVisualization = () => {
         documents).
       </p>
 
-      <div className="flex flex-col md:flex-row justify-center items-center gap-2 mb-8 overflow-x-auto py-4">
+      <div className="flex flex-col md:flex-row items-center gap-2 mb-8 overflow-x-auto py-4 md:px-2">
         {pipelineSteps.map((step, index) => (
           <React.Fragment key={step.name}>
             <motion.div
-              className={`p-2 rounded-lg shadow-sm cursor-pointer flex-shrink-0 w-full md:w-44
+              className={`p-2 rounded-lg shadow-sm cursor-pointer flex-shrink-0 w-full md:w-36
                 ${
                   index === currentStep
                     ? "bg-primary/10 border-2 border-primary"

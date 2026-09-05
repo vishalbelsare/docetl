@@ -4,7 +4,8 @@ from typing import Any
 import tiktoken
 from pydantic import field_validator, model_validator
 
-from docetl.operations.base import BaseOperation
+from docetl.operations.base import BaseOperation, Cardinality
+from docetl.operations.utils.validation import lookup_field
 
 
 class SplitOperation(BaseOperation):
@@ -50,6 +51,47 @@ class SplitOperation(BaseOperation):
         super().__init__(*args, **kwargs)
         self.name = self.config["name"]
 
+    @classmethod
+    def transform_schema(cls, schema, config):
+        result = super().transform_schema(schema, config)
+        if config.get("split_key"):
+            result[f"{config['split_key']}_chunk"] = "string"
+        name = config.get("name", "split")
+        result[f"{name}_id"] = "string"
+        result[f"{name}_chunk_num"] = "integer"
+        return result
+
+    # ── plan traits ────────────────────────────────────────────────
+    # Not deterministic: each source document gets a fresh uuid as
+    # {name}_id.
+
+    @classmethod
+    def cardinality(cls, config: dict[str, Any]) -> Cardinality:
+        return Cardinality.ONE_TO_MANY
+
+    @classmethod
+    def fields_read(cls, config: dict[str, Any]) -> "frozenset[str] | None":
+        if not config.get("split_key"):
+            return None
+        return frozenset({config["split_key"]})
+
+    @classmethod
+    def fields_written(cls, config: dict[str, Any]) -> "frozenset[str] | None":
+        if not config.get("split_key"):
+            return None
+        name = config.get("name", "split")
+        return frozenset(
+            {f"{config['split_key']}_chunk", f"{name}_id", f"{name}_chunk_num"}
+        )
+
+    @classmethod
+    def is_row_local(cls, config: dict[str, Any]) -> bool:
+        return True
+
+    @classmethod
+    def preserves_order(cls, config: dict[str, Any]) -> bool:
+        return True
+
     def execute(self, input_data: list[dict]) -> tuple[list[dict], float]:
         split_key = self.config["split_key"]
         method = self.config["method"]
@@ -67,10 +109,10 @@ class SplitOperation(BaseOperation):
         cost = 0.0
 
         for item in input_data:
-            if split_key not in item:
+            try:
+                content = lookup_field(item, split_key)
+            except Exception:
                 raise KeyError(f"Split key '{split_key}' not found in item")
-
-            content = item[split_key]
             doc_id = str(uuid.uuid4())
 
             if method == "token_count":

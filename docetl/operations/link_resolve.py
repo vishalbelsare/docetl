@@ -6,12 +6,23 @@ from rich.prompt import Confirm
 from sklearn.metrics.pairwise import cosine_similarity
 
 from docetl.operations.base import BaseOperation
-from docetl.operations.utils import RichLoopBar, strict_render
+from docetl.operations.utils import RichLoopBar, lookup_field, strict_render
+from docetl.utils import ensure_non_jinja_prompt_confirmed
 
 from .clustering_utils import get_embeddings_for_clustering
 
 
 class LinkResolveOperation(BaseOperation):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "comparison_prompt",
+            "_append_document_to_comparison_prompt",
+            console=self.console,
+            status=self.status,
+        )
+
     def execute(self, input_data: list[dict]) -> tuple[list[dict], float]:
         """
         Executes the resolve links operation on the provided dataset.
@@ -36,16 +47,22 @@ class LinkResolveOperation(BaseOperation):
         # Note: We don't want to use text-embedding-3-small as it has bad performance on short texts...
         embedding_model = self.config.get("embedding_model", "text-embedding-ada-002")
 
-        item_by_id = {item[id_key]: item for item in input_data}
+        item_by_id = {lookup_field(item, id_key): item for item in input_data}
 
-        id_values = set([item[id_key] for item in input_data])
+        id_values = set([lookup_field(item, id_key) for item in input_data])
 
         link_values = set()
         for item in input_data:
-            link_values.update(item[link_key])
+            link_values.update(lookup_field(item, link_key))
 
         to_resolve = list(link_values - id_values)
         id_values = list(id_values)
+
+        if not to_resolve:
+            # Every link already points at a canonical id — nothing to do
+            # (and the embedding/similarity path below requires non-empty
+            # inputs).
+            return input_data, 0
 
         if not blocking_threshold and not blocking_conditions:
             # Prompt the user for confirmation
@@ -123,7 +140,8 @@ class LinkResolveOperation(BaseOperation):
 
         for item in input_data:
             item[link_key] = [
-                self.replacements.get(value, value) for value in item[link_key]
+                self.replacements.get(value, value)
+                for value in lookup_field(item, link_key)
             ]
 
         return input_data, total_cost

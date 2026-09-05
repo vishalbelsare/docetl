@@ -10,20 +10,35 @@ site_name: docetl docs
 repo_url: https://github.com/ucbepic/docetl
 repo_name: ucbepic/docetl
 remote_branch: gh-pages
+
+# Deliberately unlisted: TODO stubs, internal design notes, and deprecated
+# V1-optimizer pages kept for old links.
+not_in_nav: |
+  tutorial-pythonapi.md
+  python/index.md
+  advanced/custom-operators.md
+  advanced/extending-agents.md
+  advanced/performance-tuning.md
+  design/model-cascade.md
+  examples/annotating-legal-documents.md
+  examples/characterizing-troll-behavior.md
+  optimization/configuration.md
+  optimization/example.md
+  optimization/fallback-models.md
+  optimization/python-api.md
 nav:
   - Getting Started:
       - Overview: index.md
       - Installation: installation.md
+      - Quick Start (Claude Code): quickstart-claude-code.md
       - Quick Start Tutorial: tutorial.md
-      - Quick Start Tutorial (Python API): tutorial-pythonapi.md
       - Best Practices: best-practices.md
   
   - User Guide:
-      - Core Concepts:
-          - Operators & Validation: concepts/operators.md
-          - Output Schemas: concepts/schemas.md
-          - Pipelines: concepts/pipelines.md
-          - Optimization: concepts/optimization.md
+      - Pipelines: concepts/pipelines.md
+      - Datasets & Frames: concepts/datasets.md
+      - Operators & Validation: concepts/operators.md
+      - Output Schemas: concepts/schemas.md
       - LLM-Powered Operators:
           - Map: operators/map.md
           - Resolve: operators/resolve.md
@@ -34,28 +49,40 @@ nav:
           - Rank: operators/rank.md
           - Extract: operators/extract.md
           - Cluster: operators/cluster.md
+          - Link Resolve: operators/link-resolve.md
       - Auxiliary Operators:
           - Split: operators/split.md
           - Gather: operators/gather.md
           - Unnest: operators/unnest.md
           - Sample: operators/sample.md
+          - TopK: operators/topk.md
           - Code: operators/code.md
-      - APIs:
-          - Python API Guide: 
-              - Overview: python/index.md
-              - Examples: python/examples.md
-          - Pandas Integration:
-              - Overview: pandas/index.md
-              - Operations: pandas/operations.md
-              - Examples: pandas/examples.md
-      - Performance:
-          - Optimization Overview: optimization/overview.md
-          - Configuration: optimization/configuration.md
-          - Examples:
-              - Basic Example: optimization/example.md
-              - Python API Example: optimization/python-api.md
+      - Retrievers: retrievers.md
+      - Interactive Progress View: execution/interactive-progress.md
+      - Python API Reference: api-reference/python.md
+      - Pandas Accessor: pandas/index.md
+  
+  - Optimization:
+      - Overview: optimization/overview.md
+      - Plan Rewrites: optimization/plan-rewrites.md
+      - Model Cascades (BARGAIN): optimization/cascades.md
+      - MOAR Optimizer:
+          - Introduction: optimization/moar.md
+          - Getting Started: optimization/moar/getting-started.md
+          - Configuration: optimization/moar/configuration.md
+          - Evaluation Functions: optimization/moar/evaluation.md
+          - Understanding Results: optimization/moar/results.md
+          - Examples: optimization/moar/examples.md
+          - Troubleshooting: optimization/moar/troubleshooting.md
+      # - Configuration: optimization/configuration.md  # V1 optimizer - commented out
+      # - Fallback Models: optimization/fallback-models.md  # V1 optimizer - commented out
+      # - Examples:
+      #     - Basic Example: optimization/example.md  # V1 optimizer - commented out
+      #     - Python API Example: optimization/python-api.md  # V1 optimizer - commented out
   
   - Tutorials & Examples:
+    - Python API Examples: python/examples.md
+    - Tool-Equipped Agents: examples/tool-equipped-research-agents.md
     - Presidential Debate Analysis: examples/presidential-debate-themes.md
     - Product Review Mining: examples/mining-product-reviews.md
     - Medical Document Classification: examples/ollama.md
@@ -63,7 +90,8 @@ nav:
     - PDF Analysis (NTSB Airplane Crashes): examples/pdf-analysis-gemini.md
   
   - Developer Reference:
-      - Technical Guides:
+      - Development Guides:
+          - MOAR Rewrite Directives: developer-reference/moar-extensibility.md
           - Custom Data Parsing: examples/custom-parsing.md
           - Rate Limiting Implementation: examples/rate-limiting.md
       - API Reference:
@@ -71,11 +99,11 @@ nav:
           - CLI Interface: api-reference/cli.md
           - Operations: api-reference/operations.md
           - Optimizers: api-reference/optimizers.md
-          - Python API: api-reference/python.md
   
   - Tools & Resources:
-      - UI Playground:
+      - DocWrangler:
           - Setup: playground/index.md
+          - Features: playground/features.md
           - Tutorial: playground/tutorial.md
       - Community:
           - Getting Involved: community/index.md
@@ -165,5 +193,5 @@ markdown_extensions:
   - pymdownx.details
   - attr_list
   - pymdownx.emoji:
-      emoji_index: !!python/name:materialx.emoji.twemoji
-      emoji_generator: !!python/name:materialx.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg

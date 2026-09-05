@@ -1,18 +1,7 @@
 # ruff: noqa: F811
 
 from docetl.operations.map import MapOperation
-from tests.conftest import (
-    runner,
-    map_config_with_batching,
-    default_model,
-    max_threads,
-    map_sample_data,
-    map_sample_data_large,
-    map_config,
-    synthetic_data,
-)
 import pytest
-import docetl
 
 
 # =============================================================================
@@ -194,6 +183,21 @@ def test_map_operation_with_batching(
         any(vs in result["sentiment"] for vs in valid_sentiments) for result in results
     )
 
+def test_map_operation_limit(
+    map_config,
+    default_model,
+    max_threads,
+    map_sample_data,
+    runner,
+):
+    map_config["limit"] = 2
+    map_config["bypass_cache"] = True
+    operation = MapOperation(runner, map_config, default_model, max_threads)
+    results, cost = operation.execute(map_sample_data)
+
+    assert len(results) == 2
+    assert cost >= 0
+
 
 def test_map_operation_with_empty_input(
     map_config_with_batching, default_model, max_threads, runner
@@ -223,15 +227,9 @@ def test_map_operation_with_large_max_batch_size(
     assert len(results) == len(map_sample_data)
 
 
-def test_map_operation_with_word_count_tool(
-    map_config_with_tools, synthetic_data, runner
-):
-    operation = MapOperation(runner, map_config_with_tools, "gpt-4o-mini", 4)
-    results, cost = operation.execute(synthetic_data)
-
-    assert len(results) == len(synthetic_data)
-    assert all("word_count" in result for result in results)
-    assert [result["word_count"] for result in results] == [5, 6, 5, 1]
+def test_map_operation_rejects_legacy_tools(map_config_with_tools, runner):
+    with pytest.raises(ValueError, match="legacy 'tools'.*removed"):
+        MapOperation(runner, map_config_with_tools, "gpt-4o-mini", 4)
 
 
 @pytest.fixture
@@ -490,8 +488,6 @@ def test_map_operation_partial_checkpoint(
     - Verifies that at least one partial checkpoint file (e.g. batch_0.json) is present and contains valid JSON.
     """
     import json
-    import os
-
     # Set up the intermediate directory in the temporary path.
     intermediate_dir = tmp_path / "intermediate_results"
     intermediate_dir.mkdir()
@@ -614,3 +610,29 @@ def test_should_glean_condition(runner):
     # Case 3: No condition key -> default to True
     assert wrapper.should_glean({}, {"flag": False}) is True
     assert wrapper.should_glean(None, {"flag": False}) is True
+
+
+def test_map_type_validation_int_answer(runner):
+    # Configure a prompt likely to produce non-integer output, but require integer in schema
+    map_config = {
+        "name": "yes_no_int",
+        "type": "map",
+        "prompt": "{{ input.doc }}. Return the answer as 'hi'.",
+        "output": {"schema": {"answer": "bool"}},
+        "model": "gpt-4o-mini",
+        "bypass_cache": True,
+        "num_retries_on_validate_failure": 1,
+    }
+
+    # Create small docs that don't influence the prompt
+    input_data = [{"doc": "hi"} for i in range(8)]
+
+    operation = MapOperation(runner, map_config, "gpt-4o-mini", 4)
+    results, cost = operation.execute(input_data)
+
+    # We likely triggered type validation failures, so no results should be accepted
+    assert cost > 0
+    
+    # For every result make sure the answer is a bool
+    for result in results:
+        assert isinstance(result["answer"], bool)

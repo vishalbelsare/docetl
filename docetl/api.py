@@ -1,66 +1,25 @@
-"""
-This module defines the core data structures and classes for the DocETL pipeline.
-
-It includes Pydantic models for various operation types, pipeline steps, and the main Pipeline class.
-The module provides a high-level API for defining, optimizing, and running document processing pipelines.
-
-Classes:
-    Dataset: Represents a dataset with a type, path, and optional parsing tools.
-    BaseOp: Base class for all operation types.
-    MapOp: Represents a map operation in the pipeline.
-    ResolveOp: Represents a resolve operation for entity resolution.
-    ReduceOp: Represents a reduce operation in the pipeline.
-    ParallelMapOp: Represents a parallel map operation.
-    FilterOp: Represents a filter operation in the pipeline.
-    EquijoinOp: Represents an equijoin operation for joining datasets.
-    SplitOp: Represents a split operation for dividing data.
-    GatherOp: Represents a gather operation for collecting data.
-    UnnestOp: Represents an unnest operation for flattening nested structures.
-    PipelineStep: Represents a step in the pipeline with input and operations.
-    PipelineOutput: Defines the output configuration for the pipeline.
-    Pipeline: Main class for defining and running a complete document processing pipeline.
-
-The Pipeline class provides methods for optimizing and running the defined pipeline,
-as well as utility methods for converting between dictionary and object representations.
-
-Usage:
-    from docetl.api import Pipeline, Dataset, MapOp, ReduceOp
-
-    pipeline = Pipeline(
-        datasets={
-            "input": Dataset(
-                type="file",
-                path="input.json",
-                parsing=[{"name": "txt_to_string", "input_key": "text", "output_key": "content"}]
-            )
-        },
-        operations=[
-            MapOp(name="process", type="map", prompt="Process the document"),
-            ReduceOp(name="summarize", type="reduce", reduce_key="content")
-        ],
-        steps=[
-            PipelineStep(name="process_step", input="input", operations=["process"]),
-            PipelineStep(name="summarize_step", input="process_step", operations=["summarize"])
-        ],
-        output=PipelineOutput(type="file", path="output.json")
-    )
-
-    optimized_pipeline = pipeline.optimize()
-    result = optimized_pipeline.run()
-"""
+"""High-level API for defining, optimizing, and running DocETL pipelines."""
 
 import inspect
 import os
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import yaml
 from rich import print
 
 from docetl.runner import DSLRunner
+from docetl.utils import op_ref_name
+
+if TYPE_CHECKING:
+    from docetl.moar.optimizer import MOARResult
 from docetl.schemas import (
     ClusterOp,
+    CodeFilterOp,
+    CodeMapOp,
+    CodeReduceOp,
     Dataset,
     EquijoinOp,
+    ExtractOp,
     FilterOp,
     GatherOp,
     MapOp,
@@ -78,61 +37,31 @@ from docetl.schemas import (
 
 
 class Pipeline:
+    """Typed pipeline object API.
+
+    .. deprecated::
+        Prefer the Frame API (``docetl.read_json(...).map(...)``) for new
+        code. Kept for backward compatibility and internal use
+        (``DSLRunner`` builds one from every config).
     """
-    Represents a complete document processing pipeline.
 
-    Attributes:
-        name (str): The name of the pipeline.
-        datasets (dict[str, Dataset]): A dictionary of datasets used in the pipeline,
-                                       where keys are dataset names and values are Dataset objects.
-        operations (list[OpType]): A list of operations to be performed in the pipeline.
-        steps (list[PipelineStep]): A list of steps that make up the pipeline.
-        output (PipelineOutput): The output configuration for the pipeline.
-        parsing_tools (list[ParsingTool]): A list of parsing tools used in the pipeline.
-                                           Defaults to an empty list.
-        default_model (str | None): The default language model to use for operations
-                                       that require one. Defaults to None.
-
-    Example:
-        ```python
-        def custom_parser(text: str) -> list[str]:
-            # this will convert the text in the column to uppercase
-            # You should return a list of strings, where each string is a separate document
-            return [text.upper()]
-
-        pipeline = Pipeline(
-            name="document_processing_pipeline",
-            datasets={
-                "input_data": Dataset(type="file", path="/path/to/input.json", parsing=[{"name": "custom_parser", "input_key": "content", "output_key": "uppercase_content"}]),
-            },
-            parsing_tools=[custom_parser],
-            operations=[
-                MapOp(
-                    name="process",
-                    type="map",
-                    prompt="Determine what type of document this is: {{ input.uppercase_content }}",
-                    output={"schema": {"document_type": "string"}}
-                ),
-                ReduceOp(
-                    name="summarize",
-                    type="reduce",
-                    reduce_key="document_type",
-                    prompt="Summarize the processed contents: {% for item in inputs %}{{ item.uppercase_content }} {% endfor %}",
-                    output={"schema": {"summary": "string"}}
-                )
-            ],
-            steps=[
-                PipelineStep(name="process_step", input="input_data", operations=["process"]),
-                PipelineStep(name="summarize_step", input="process_step", operations=["summarize"])
-            ],
-            output=PipelineOutput(type="file", path="/path/to/output.json"),
-            default_model="gpt-4o-mini"
-        )
-        ```
-
-    This example shows a complete pipeline configuration with datasets, operations,
-    steps, and output settings.
-    """
+    _OP_TYPE_REGISTRY: dict[str, type] = {
+        "map": MapOp,
+        "resolve": ResolveOp,
+        "reduce": ReduceOp,
+        "parallel_map": ParallelMapOp,
+        "filter": FilterOp,
+        "equijoin": EquijoinOp,
+        "split": SplitOp,
+        "gather": GatherOp,
+        "unnest": UnnestOp,
+        "cluster": ClusterOp,
+        "sample": SampleOp,
+        "code_map": CodeMapOp,
+        "code_reduce": CodeReduceOp,
+        "code_filter": CodeFilterOp,
+        "extract": ExtractOp,
+    }
 
     def __init__(
         self,
@@ -166,45 +95,144 @@ class Pipeline:
         self.rate_limits = rate_limits
         self.optimizer_config = optimizer_config
 
-        # Add other kwargs to self.other_config
         self.other_config = kwargs
 
         self._load_env()
 
-    def _load_env(self):
-        import os
+    @property
+    def ops_by_name(self) -> dict[str, OpType]:
+        return {op.name: op for op in self.operations}
 
+    def get_step_for_op(self, op_name: str) -> PipelineStep:
+        for step in self.steps:
+            for entry in step.operations:
+                name = op_ref_name(entry)
+                if name == op_name:
+                    return step
+        raise KeyError(f"Operation {op_name!r} not found in any step")
+
+    @classmethod
+    def from_dict(cls, config: dict[str, Any], name: str | None = None) -> "Pipeline":
+        datasets = {}
+        for ds_name, ds_cfg in config.get("datasets", {}).items():
+            datasets[ds_name] = Dataset(**ds_cfg)
+
+        operations: list[OpType] = []
+        for op_cfg in config.get("operations", []):
+            op_type = op_cfg.get("type")
+            schema_cls = cls._OP_TYPE_REGISTRY.get(op_type)
+            filtered = {k: v for k, v in op_cfg.items() if v is not None}
+            if schema_cls is not None:
+                try:
+                    operations.append(schema_cls(**filtered))
+                except Exception:
+                    # Keep the correct op type even when validation fails —
+                    # syntax_check reports the validation error loudly on
+                    # every run path, but typed inspection (ops_by_name,
+                    # list_pipeline_operations) must not misreport the type.
+                    operations.append(schema_cls.model_construct(**filtered))
+            else:
+                operations.append(MapOp.model_construct(**filtered))
+
+        steps = []
+        for step_cfg in config.get("pipeline", {}).get("steps", []):
+            steps.append(
+                PipelineStep(**{k: v for k, v in step_cfg.items() if v is not None})
+            )
+
+        # Copy before defaulting — the caller's config must not be mutated.
+        output_cfg = {
+            "type": "file",
+            "path": "",
+            **(config.get("pipeline", {}).get("output") or {}),
+        }
+        output = PipelineOutput(**output_cfg)
+
+        parsing_tools = []
+        for tool_cfg in config.get("parsing_tools", []) or []:
+            if isinstance(tool_cfg, ParsingTool):
+                parsing_tools.append(tool_cfg)
+            elif isinstance(tool_cfg, dict):
+                parsing_tools.append(ParsingTool(**tool_cfg))
+
+        known_keys = {
+            "datasets",
+            "operations",
+            "pipeline",
+            "default_model",
+            "parsing_tools",
+            "rate_limits",
+            "optimizer_config",
+        }
+        other = {k: v for k, v in config.items() if k not in known_keys}
+
+        return cls(
+            name=name or "pipeline",
+            datasets=datasets,
+            operations=operations,
+            steps=steps,
+            output=output,
+            parsing_tools=parsing_tools,
+            default_model=config.get("default_model"),
+            rate_limits=config.get("rate_limits"),
+            optimizer_config=config.get("optimizer_config", {}),
+            **other,
+        )
+
+    def _load_env(self):
         from dotenv import load_dotenv
 
-        # Get the current working directory
-        cwd = os.getcwd()
-
-        # Load .env file from the current working directory if it exists
-        env_file = os.path.join(cwd, ".env")
+        env_file = os.path.join(os.getcwd(), ".env")
         if os.path.exists(env_file):
             load_dotenv(env_file)
 
     def optimize(
         self,
+        method: str = "moar",
+        # MOAR parameters
+        eval_fn: Any = None,
+        metric_key: str | None = None,
+        models: list[str] | None = None,
+        agent_model: str | None = None,
+        max_iterations: int = 20,
+        save_dir: str | None = None,
+        exploration_weight: float = 1.414,
+        dataset_path: str | None = None,
+        # V1 parameters
         max_threads: int | None = None,
         resume: bool = False,
         save_path: str | None = None,
-    ) -> "Pipeline":
-        """
-        Optimize the pipeline using the Optimizer.
+    ) -> "MOARResult | Pipeline":
+        if method == "moar":
+            return self._optimize_moar(
+                eval_fn=eval_fn,
+                metric_key=metric_key,
+                models=models,
+                agent_model=agent_model,
+                max_iterations=max_iterations,
+                save_dir=save_dir,
+                exploration_weight=exploration_weight,
+                dataset_path=dataset_path,
+            )
+        elif method == "v1":
+            return self._optimize_v1(
+                max_threads=max_threads,
+                resume=resume,
+                save_path=save_path,
+            )
+        else:
+            raise ValueError(
+                f"Unknown optimization method {method!r}. Use 'moar' or 'v1'."
+            )
 
-        Args:
-            max_threads (int | None): Maximum number of threads to use for optimization.
-            model (str): The model to use for optimization. Defaults to "gpt-4o".
-            resume (bool): Whether to resume optimization from a previous state. Defaults to False.
-            timeout (int): Timeout for optimization in seconds. Defaults to 60.
+    def _optimize_moar(self, *, eval_fn, metric_key, **kwargs) -> "MOARResult":
+        from docetl.moar.optimizer import run_moar
 
-        Returns:
-            Pipeline: An optimized version of the pipeline.
-        """
-        config = self._to_dict()
+        return run_moar(self, eval_fn=eval_fn, metric_key=metric_key, **kwargs)
+
+    def _optimize_v1(self, *, max_threads, resume, save_path) -> "Pipeline":
         runner = DSLRunner(
-            config,
+            self._to_dict(),
             base_name=os.path.join(os.getcwd(), self.name),
             yaml_file_suffix=self.name,
             max_threads=max_threads,
@@ -215,7 +243,7 @@ class Pipeline:
             save_path=save_path,
         )
 
-        updated_pipeline = Pipeline(
+        updated = Pipeline(
             name=self.name,
             datasets=self.datasets,
             operations=self.operations,
@@ -225,22 +253,12 @@ class Pipeline:
             parsing_tools=self.parsing_tools,
             optimizer_config=self.optimizer_config,
         )
-        updated_pipeline._update_from_dict(optimized_config)
-        return updated_pipeline
+        updated._update_from_dict(optimized_config)
+        return updated
 
     def run(self, max_threads: int | None = None) -> float:
-        """
-        Run the pipeline using the DSLRunner.
-
-        Args:
-            max_threads (int | None): Maximum number of threads to use for execution.
-
-        Returns:
-            float: The total cost of running the pipeline.
-        """
-        config = self._to_dict()
         runner = DSLRunner(
-            config,
+            self,
             base_name=os.path.join(os.getcwd(), self.name),
             yaml_file_suffix=self.name,
             max_threads=max_threads,
@@ -248,16 +266,20 @@ class Pipeline:
         result = runner.load_run_save()
         return result
 
+    def run_with_stats(self, max_threads: int | None = None) -> dict[str, Any]:
+        runner = DSLRunner(
+            self,
+            base_name=os.path.join(os.getcwd(), self.name),
+            yaml_file_suffix=self.name,
+            max_threads=max_threads,
+        )
+        runner.load_run_save()
+        return {
+            "cost": runner.total_cost,
+            "token_usage": dict(runner.total_token_usage),
+        }
+
     def to_yaml(self, path: str) -> None:
-        """
-        Convert the Pipeline object to a YAML string and save it to a file.
-
-        Args:
-            path (str): Path to save the YAML file.
-
-        Returns:
-            None
-        """
         config = self._to_dict()
         with open(path, "w") as f:
             yaml.safe_dump(config, f)
@@ -265,30 +287,29 @@ class Pipeline:
         print(f"[green]Pipeline saved to {path}[/green]")
 
     def _to_dict(self) -> dict[str, Any]:
-        """
-        Convert the Pipeline object to a dictionary representation.
-
-        Returns:
-            dict[str, Any]: Dictionary representation of the Pipeline.
-        """
         d = {
             "datasets": {
-                name: dataset.dict() for name, dataset in self.datasets.items()
+                name: (
+                    dataset.model_dump()
+                    if hasattr(dataset, "model_dump")
+                    else dataset.dict()
+                )
+                for name, dataset in self.datasets.items()
             },
             "operations": [
-                {k: v for k, v in op.dict().items() if v is not None}
+                op.model_dump(exclude_none=True, exclude_unset=True)
                 for op in self.operations
             ],
             "pipeline": {
                 "steps": [
-                    {k: v for k, v in step.dict().items() if v is not None}
+                    {k: v for k, v in step.model_dump().items() if v is not None}
                     for step in self.steps
                 ],
-                "output": self.output.dict(),
+                "output": self.output.model_dump(),
             },
             "default_model": self.default_model,
             "parsing_tools": (
-                [tool.dict() for tool in self.parsing_tools]
+                [tool.model_dump() for tool in self.parsing_tools]
                 if self.parsing_tools
                 else None
             ),
@@ -300,54 +321,15 @@ class Pipeline:
         return d
 
     def _update_from_dict(self, config: dict[str, Any]):
-        """
-        Update the Pipeline object from a dictionary representation.
-
-        Args:
-            config (dict[str, Any]): Dictionary representation of the Pipeline.
-        """
-        self.datasets = {
-            name: Dataset(
-                type=dataset["type"],
-                source=dataset["source"],
-                path=dataset["path"],
-                parsing=dataset.get("parsing"),
-            )
-            for name, dataset in config["datasets"].items()
-        }
-        self.operations = []
-        for op in config["operations"]:
-            op_type = op.pop("type")
-            if op_type == "map":
-                self.operations.append(MapOp(**op, type=op_type))
-            elif op_type == "resolve":
-                self.operations.append(ResolveOp(**op, type=op_type))
-            elif op_type == "reduce":
-                self.operations.append(ReduceOp(**op, type=op_type))
-            elif op_type == "parallel_map":
-                self.operations.append(ParallelMapOp(**op, type=op_type))
-            elif op_type == "filter":
-                self.operations.append(FilterOp(**op, type=op_type))
-            elif op_type == "equijoin":
-                self.operations.append(EquijoinOp(**op, type=op_type))
-            elif op_type == "split":
-                self.operations.append(SplitOp(**op, type=op_type))
-            elif op_type == "gather":
-                self.operations.append(GatherOp(**op, type=op_type))
-            elif op_type == "unnest":
-                self.operations.append(UnnestOp(**op, type=op_type))
-            elif op_type == "cluster":
-                self.operations.append(ClusterOp(**op, type=op_type))
-            elif op_type == "sample":
-                self.operations.append(SampleOp(**op, type=op_type))
-        self.steps = [PipelineStep(**step) for step in config["pipeline"]["steps"]]
-        self.output = PipelineOutput(**config["pipeline"]["output"])
-        self.default_model = config.get("default_model")
-        self.parsing_tools = (
-            [ParsingTool(**tool) for tool in config.get("parsing_tools", [])]
-            if config.get("parsing_tools")
-            else []
-        )
+        other = Pipeline.from_dict(config, name=self.name)
+        self.datasets = other.datasets
+        self.operations = other.operations
+        self.steps = other.steps
+        self.output = other.output
+        self.default_model = other.default_model
+        self.parsing_tools = other.parsing_tools
+        self.optimizer_config = other.optimizer_config
+        self.other_config = other.other_config
 
 
 # Export the main classes and functions for easy import
@@ -363,6 +345,10 @@ __all__ = [
     "SplitOp",
     "GatherOp",
     "UnnestOp",
+    "CodeMapOp",
+    "CodeReduceOp",
+    "CodeFilterOp",
+    "ExtractOp",
     "PipelineStep",
     "PipelineOutput",
     "ParsingTool",

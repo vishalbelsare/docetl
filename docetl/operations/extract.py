@@ -9,8 +9,9 @@ from typing import Any, Literal
 from jinja2 import Template
 from pydantic import Field, field_validator
 
-from docetl.operations.base import BaseOperation
-from docetl.operations.utils import RichLoopBar, strict_render
+from docetl.operations.base import BaseOperation, Cardinality
+from docetl.operations.utils import RichLoopBar, lookup_field, strict_render
+from docetl.utils import ensure_non_jinja_prompt_confirmed, has_jinja_syntax
 
 
 class ExtractOperation(BaseOperation):
@@ -25,9 +26,14 @@ class ExtractOperation(BaseOperation):
         timeout: int | None = None
         skip_on_error: bool = False
         litellm_completion_kwargs: dict[str, Any] = Field(default_factory=dict)
+        limit: int | None = Field(None, gt=0)
 
         @field_validator("prompt")
         def validate_prompt(cls, v):
+            # Check if it has Jinja syntax
+            if not has_jinja_syntax(v):
+                # This will be handled during initialization with user confirmation
+                return v
             try:
                 Template(v)
             except Exception as e:
@@ -35,6 +41,64 @@ class ExtractOperation(BaseOperation):
                     f"Invalid Jinja2 template in 'prompt': {str(e)}"
                 ) from e
             return v
+
+    @classmethod
+    def transform_schema(cls, schema, config):
+        result = super().transform_schema(schema, config)
+        suffix = config.get("extraction_key_suffix") or (
+            f"_extracted_{config.get('name', '')}"
+        )
+        value_type = (
+            "string" if config.get("format_extraction", True) else "list[string]"
+        )
+        for doc_key in config.get("document_keys") or []:
+            result[f"{doc_key}{suffix}"] = value_type
+        return result
+
+    # ── plan traits ────────────────────────────────────────────────
+
+    @classmethod
+    def cardinality(cls, config):
+        # execute() reads skip_on_error with a *True* default (unlike the
+        # schema's declared False — a pre-existing discrepancy), and under
+        # it rows whose document_keys are missing/non-string are dropped
+        # entirely. The trait must mirror what execute() does: only an
+        # explicit skip_on_error=False yields at-most-one-output-per-row.
+        if config.get("skip_on_error", True) or config.get("limit"):
+            return Cardinality.MANY_TO_MANY
+        return Cardinality.ONE_TO_ONE
+
+    @classmethod
+    def fields_read(cls, config):
+        from docetl.utils import extract_input_field_reads
+
+        if config.get("retriever"):
+            return None
+        reads = extract_input_field_reads(config.get("prompt"))
+        if reads is None:
+            return None  # non-Jinja prompts get the document appended
+        return reads | frozenset(config.get("document_keys") or [])
+
+    @classmethod
+    def fields_written(cls, config):
+        suffix = config.get("extraction_key_suffix") or (
+            f"_extracted_{config.get('name', '')}"
+        )
+        return frozenset(
+            f"{doc_key}{suffix}" for doc_key in config.get("document_keys") or []
+        )
+
+    @classmethod
+    def is_llm(cls, config):
+        return True
+
+    @classmethod
+    def is_row_local(cls, config):
+        return True
+
+    @classmethod
+    def preserves_order(cls, config):
+        return True
 
     def __init__(
         self,
@@ -47,6 +111,13 @@ class ExtractOperation(BaseOperation):
             self.extraction_key_suffix = f"_extracted_{self.config['name']}"
         else:
             self.extraction_key_suffix = self.config["extraction_key_suffix"]
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "prompt",
+            "_append_document_to_prompt",
+            console=self.console,
+            status=self.status,
+        )
 
     def _reformat_text_with_line_numbers(self, text: str, line_width: int = 80) -> str:
         """
@@ -103,7 +174,7 @@ class ExtractOperation(BaseOperation):
 
     def _execute_line_number_strategy(
         self, item: dict, doc_key: str
-    ) -> tuple[list[dict[str, Any]], float]:
+    ) -> tuple[list[str], float, str]:
         """
         Executes the line number extraction strategy for a single document key.
 
@@ -115,7 +186,11 @@ class ExtractOperation(BaseOperation):
             tuple[list[dict[str, Any]], float]: A tuple containing the extraction results and the cost.
         """
         # Get the text content from the document
-        if doc_key not in item or not isinstance(item[doc_key], str):
+        try:
+            text_content = lookup_field(item, doc_key)
+            if not isinstance(text_content, str):
+                raise TypeError("not a string")
+        except Exception:
             if self.config.get("skip_on_error", True):
                 self.console.log(
                     f"[yellow]Warning: Key '{doc_key}' not found or not a string in document. Skipping.[/yellow]"
@@ -126,15 +201,21 @@ class ExtractOperation(BaseOperation):
                     f"Key '{doc_key}' not found or not a string in document"
                 )
 
-        text_content = item[doc_key]
-
         # Reformat the text with line numbers
         formatted_text = self._reformat_text_with_line_numbers(text_content)
 
         # Render the prompt
-        extraction_instructions = strict_render(self.config["prompt"], {"input": item})
+        # Retrieval context
+        retrieval_context = self._maybe_build_retrieval_context({"input": item})
+        extraction_instructions = strict_render(
+            self.config["prompt"],
+            {"input": item, "retrieval_context": retrieval_context},
+        )
         augmented_prompt_template = """
 You are extracting specific content from text documents. Extract information according to these instructions: {{ extraction_instructions }}
+
+Extra context (may be helpful):
+{{ retrieval_context }}
 
 The text is formatted with line numbers as follows:
 {{ formatted_text }}
@@ -162,6 +243,7 @@ Do not include explanatory text in your response, only the JSON object.
             {
                 "extraction_instructions": extraction_instructions,
                 "formatted_text": formatted_text,
+                "retrieval_context": retrieval_context,
             },
         )
 
@@ -202,7 +284,7 @@ Do not include explanatory text in your response, only the JSON object.
                 self.console.log(
                     f"[bold red]Error parsing LLM response: {llm_result.response}. Skipping.[/bold red]"
                 )
-                return [], llm_result.total_cost
+                return [], llm_result.total_cost, retrieval_context
 
             for line_range in parsed_output.get("line_ranges", []):
                 start_line = line_range.get("start_line", 0)
@@ -230,20 +312,20 @@ Do not include explanatory text in your response, only the JSON object.
 
                 extracted_texts.append("".join(extracted_content))
 
-            return extracted_texts, llm_result.total_cost
+            return extracted_texts, llm_result.total_cost, retrieval_context
 
         except Exception as e:
             if self.config.get("skip_on_error", True):
                 self.console.log(
                     f"[bold red]Error parsing LLM response: {str(e)}. Skipping.[/bold red]"
                 )
-                return [], llm_result.total_cost
+                return [], llm_result.total_cost, retrieval_context
             else:
                 raise RuntimeError(f"Error parsing LLM response: {str(e)}") from e
 
     def _execute_regex_strategy(
         self, item: dict, doc_key: str
-    ) -> tuple[list[str], float]:
+    ) -> tuple[list[str], float, str]:
         """
         Executes the regex extraction strategy for a single document key.
 
@@ -252,31 +334,41 @@ Do not include explanatory text in your response, only the JSON object.
             doc_key (str): The key of the document text to process.
 
         Returns:
-            tuple[list[str], float]: A tuple containing the extraction results and the cost.
+            tuple[list[str], float, str]: A tuple containing the extraction results, cost, and retrieval context.
         """
         import re
 
         # Get the text content from the document
-        if doc_key not in item or not isinstance(item[doc_key], str):
+        try:
+            text_content = lookup_field(item, doc_key)
+            if not isinstance(text_content, str):
+                raise TypeError("not a string")
+        except Exception:
             if self.config.get("skip_on_error", True):
                 self.console.log(
                     f"[yellow]Warning: Key '{doc_key}' not found or not a string in document. Skipping.[/yellow]"
                 )
-                return [], 0.0
+                return [], 0.0, ""
             else:
                 raise ValueError(
                     f"Key '{doc_key}' not found or not a string in document"
                 )
 
-        text_content = item[doc_key]
-
         # Prepare the context for prompt rendering
-        context = {"input": item, "text_content": text_content}
+        retrieval_context = self._maybe_build_retrieval_context({"input": item})
+        context = {
+            "input": item,
+            "text_content": text_content,
+            "retrieval_context": retrieval_context,
+        }
 
         # Render the prompt
         extraction_instructions = strict_render(self.config["prompt"], context)
         augmented_prompt_template = """
 You are creating regex patterns to extract specific content from text. Extract information according to these instructions: {{ extraction_instructions }}
+
+Extra context (may be helpful):
+{{ retrieval_context }}
 
 The text to analyze is:
 {{ text_content }}
@@ -356,14 +448,14 @@ Return only the JSON object with your patterns, no explanatory text.
                     else:
                         raise ValueError(f"Invalid regex pattern '{pattern}': {str(e)}")
 
-            return extracted_texts, llm_result.total_cost
+            return extracted_texts, llm_result.total_cost, retrieval_context
 
         except Exception as e:
             if self.config.get("skip_on_error", True):
                 self.console.log(
                     f"[bold red]Error parsing LLM response: {str(e)}. Skipping.[/bold red]"
                 )
-                return [], llm_result.total_cost
+                return [], llm_result.total_cost, retrieval_context
             else:
                 raise RuntimeError(f"Error parsing LLM response: {str(e)}") from e
 
@@ -377,6 +469,10 @@ Return only the JSON object with your patterns, no explanatory text.
         Returns:
             tuple[list[dict], float]: A tuple containing the processed data and the total cost of the operation.
         """
+        limit_value = self.config.get("limit")
+        if limit_value is not None:
+            input_data = input_data[:limit_value]
+
         if not input_data:
             return [], 0.0
 
@@ -393,7 +489,11 @@ Return only the JSON object with your patterns, no explanatory text.
 
                 # Process each document key in the item
                 for doc_key in self.config["document_keys"]:
-                    if doc_key not in item or not isinstance(item[doc_key], str):
+                    try:
+                        val = lookup_field(item, doc_key)
+                        if not isinstance(val, str):
+                            raise TypeError("not a string")
+                    except Exception:
                         if self.config.get("skip_on_error", True):
                             self.console.log(
                                 f"[yellow]Warning: Key '{doc_key}' not found or not a string in document. Skipping.[/yellow]"
@@ -431,7 +531,7 @@ Return only the JSON object with your patterns, no explanatory text.
                 doc_key, future, output_item = futures[i]
 
                 try:
-                    extracted_texts_duped, cost = future.result()
+                    extracted_texts_duped, cost, retrieval_context = future.result()
 
                     # Remove duplicates and empty strings
                     extracted_texts_duped = [
@@ -452,6 +552,12 @@ Return only the JSON object with your patterns, no explanatory text.
                         output_item[output_key] = "\n\n".join(extracted_texts)
                     else:
                         output_item[output_key] = extracted_texts
+
+                    # Save retrieved context if enabled
+                    if self.config.get("save_retriever_output", False):
+                        output_item[f"_{self.config['name']}_retrieved_context"] = (
+                            retrieval_context if retrieval_context else ""
+                        )
 
                 except Exception as e:
                     if self.config.get("skip_on_error", True):

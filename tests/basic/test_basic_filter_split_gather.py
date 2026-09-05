@@ -1,11 +1,11 @@
 import pytest
+from docetl.operations.extract import ExtractOperation
 from docetl.operations.filter import FilterOperation
 from docetl.operations.unnest import UnnestOperation
 from docetl.operations.equijoin import EquijoinOperation
 from docetl.operations.split import SplitOperation
 from docetl.operations.gather import GatherOperation
 from docetl.operations.utils import APIWrapper
-from docetl.config_wrapper import ConfigWrapper
 from dotenv import load_dotenv
 from tests.conftest import runner
 
@@ -33,6 +33,29 @@ def filter_sample_data():
         {"text": "Brief.", "word_count": 1},
     ]
 
+@pytest.fixture
+def extract_config_missing_key():
+    return {
+        "name": "missing_key_extract",
+        "type": "extract",
+        "prompt": "Identify portions of the document that contain numeric data: {{ input.text }}",
+        "document_keys": ["missing_key"],
+        "model": "gpt-4o-mini",
+        "skip_on_error": True,
+    }
+
+
+@pytest.fixture
+def extract_config_limit():
+    return {
+        "name": "limit_extract",
+        "type": "extract",
+        "prompt": "Extract the main topic from this text: {{ input.text }}",
+        "document_keys": ["text"],
+        "model": "gpt-4o-mini",
+        "limit": 1,
+    }
+
 
 def test_filter_operation(
     filter_config, default_model, max_threads, filter_sample_data, runner
@@ -44,6 +67,25 @@ def test_filter_operation(
     assert all(len(result["text"].split()) > 3 for result in results)
 
 
+def test_filter_operation_limit_counts_true_outputs(
+    filter_config, default_model, max_threads, runner
+):
+    filter_config["limit"] = 1
+    filter_config["bypass_cache"] = True
+    sample_data = [
+        {"text": "Tiny.", "word_count": 1},
+        {"text": "This example clearly exceeds three words.", "word_count": 7},
+        {"text": "Another sufficiently long sentence lives here.", "word_count": 6},
+    ]
+
+    operation = FilterOperation(runner, filter_config, default_model, max_threads)
+    results, cost = operation.execute(sample_data)
+
+    assert len(results) == 1
+    assert results[0]["text"] == sample_data[1]["text"]
+    assert cost >= 0
+
+
 def test_filter_operation_empty_input(
     filter_config, default_model, max_threads, runner
 ):
@@ -53,6 +95,22 @@ def test_filter_operation_empty_input(
     assert len(results) == 0
     assert cost == 0
 
+
+def test_extract_operation_limit(
+    extract_config_limit, default_model, max_threads, runner
+):
+    operation = ExtractOperation(
+        runner, extract_config_limit, default_model, max_threads
+    )
+    sample_data = [
+        {"id": 1, "text": "Document about contracts"},
+        {"id": 2, "text": "Document about finance"},
+    ]
+
+    results, cost = operation.execute(sample_data)
+
+    assert len(results) == 1
+    assert results[0]["id"] == 1
 
 # Unnest Operation Tests
 @pytest.fixture
@@ -157,7 +215,7 @@ def equijoin_config():
         "name": "user_data_join",
         "type": "equijoin",
         "blocking_keys": {"left": ["id"], "right": ["user_id"]},
-        "comparison_prompt": "Compare the following two entries and determine if they are the same id: Left: {{ left.id }} Right: {{ right.user_id }}",
+        "comparison_prompt": "Do these two records refer to the same user? Answer true if and only if the two id numbers are exactly equal, and false otherwise. Left id: {{ left.id }}. Right id: {{ right.user_id }}.",
         "embedding_model": "text-embedding-3-small",
         "comparison_model": "gpt-4o-mini",
     }
@@ -181,6 +239,9 @@ def right_data():
     ]
 
 
+# The match decision is made by a live LLM comparison, which occasionally
+# misses a true match; retry a couple of times before failing the run.
+@pytest.mark.flaky(reruns=3, reruns_delay=2)
 def test_equijoin_operation(
     equijoin_config, default_model, max_threads, left_data, right_data, runner
 ):

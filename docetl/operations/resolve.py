@@ -2,19 +2,32 @@
 The `ResolveOperation` class is a subclass of `BaseOperation` that performs a resolution operation on a dataset. It uses a combination of blocking techniques and LLM-based comparisons to efficiently identify and resolve duplicate or related entries within the dataset.
 """
 
+import asyncio
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Optional
 
 import jinja2
 from jinja2 import Template
 from litellm import model_cost
 from pydantic import Field, ValidationInfo, field_validator, model_validator
-from rich.prompt import Confirm
 
 from docetl.operations.base import BaseOperation
-from docetl.operations.utils import RichLoopBar, rich_as_completed, strict_render
-from docetl.utils import completion_cost, extract_jinja_variables
+from docetl.operations.utils import (
+    RichLoopBar,
+    lookup_field,
+    rich_as_completed,
+    strict_render,
+)
+from docetl.operations.utils.blocking import RuntimeBlockingOptimizer
+from docetl.operations.utils.cascade_runner import CascadeConfig, CascadeMixin
+from docetl.utils import (
+    completion_cost,
+    ensure_non_jinja_prompt_confirmed,
+    extract_comparison_field_reads,
+    extract_input_field_reads,
+    has_jinja_syntax,
+)
 
 
 def find_cluster(item, cluster_map):
@@ -24,7 +37,7 @@ def find_cluster(item, cluster_map):
     return item
 
 
-class ResolveOperation(BaseOperation):
+class ResolveOperation(BaseOperation, CascadeMixin):
     class schema(BaseOperation.schema):
         type: str = "resolve"
         comparison_prompt: str
@@ -33,8 +46,10 @@ class ResolveOperation(BaseOperation):
         embedding_model: str | None = None
         resolution_model: str | None = None
         comparison_model: str | None = None
+        cascade: Optional[CascadeConfig] = None
         blocking_keys: list[str] | None = None
         blocking_threshold: float | None = Field(None, ge=0, le=1)
+        blocking_target_recall: float | None = Field(None, ge=0, le=1)
         blocking_conditions: list[str] | None = None
         input: dict[str, Any] | None = None
         embedding_batch_size: int | None = Field(None, gt=0)
@@ -48,6 +63,10 @@ class ResolveOperation(BaseOperation):
         @field_validator("comparison_prompt")
         def validate_comparison_prompt(cls, v):
             if v is not None:
+                # Check if it has Jinja syntax
+                if not has_jinja_syntax(v):
+                    # This will be handled during initialization with user confirmation
+                    return v
                 try:
                     comparison_template = Template(v)
                     comparison_vars = comparison_template.environment.parse(v).find_all(
@@ -70,6 +89,10 @@ class ResolveOperation(BaseOperation):
         @field_validator("resolution_prompt")
         def validate_resolution_prompt(cls, v):
             if v is not None:
+                # Check if it has Jinja syntax
+                if not has_jinja_syntax(v):
+                    # This will be handled during initialization with user confirmation
+                    return v
                 try:
                     reduction_template = Template(v)
                     reduction_vars = reduction_template.environment.parse(v).find_all(
@@ -123,6 +146,39 @@ class ResolveOperation(BaseOperation):
 
             return self
 
+    # ── plan traits ────────────────────────────────────────────────
+    # Cardinality stays at the conservative MANY_TO_MANY default and
+    # fields_read at None: resolution compares rows against each other,
+    # so nothing here is row-local or order-stable.
+
+    @classmethod
+    def fields_written(cls, config):
+        return frozenset((config.get("output") or {}).get("schema") or {})
+
+    @classmethod
+    def is_llm(cls, config):
+        return True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # comparison_prompt uses input1/input2; resolution uses inputs —
+        # strict_render appends the matching document statement.
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "comparison_prompt",
+            "_append_document_to_comparison_prompt",
+            console=self.console,
+            status=self.status,
+        )
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "resolution_prompt",
+            "_append_document_to_resolution_prompt",
+            console=self.console,
+            status=self.status,
+            extra_flags={"_is_reduce_operation": True},
+        )
+
     def compare_pair(
         self,
         comparison_prompt: str,
@@ -173,6 +229,56 @@ class ResolveOperation(BaseOperation):
 
         return output["is_match"], response.total_cost, prompt
 
+    def _cascade_match_pairs(
+        self, pair_items: list, blocking_keys: list[str] | None = None
+    ) -> "tuple[list[bool], float]":
+        """Decide ``is_match`` for each candidate pair via the model cascade.
+
+        ``pair_items`` is a list of ``(item1, item2)`` dict tuples (in
+        ``blocked_pairs`` order). Returns the per-pair match decisions and the
+        total cost. Proxy is a single-token logprob compare; oracle is the
+        existing :meth:`compare_pair`. Default guarantee is ``precision``
+        (don't over-merge).
+        """
+        if not pair_items:
+            return [], 0.0
+
+        comparison_prompt = self.config["comparison_prompt"]
+        oracle_model = self.config.get("comparison_model", self.default_model)
+        bkeys = blocking_keys or []
+
+        def render_messages(pair: tuple) -> list[dict[str, str]]:
+            item1, item2 = pair
+            rendered = strict_render(
+                comparison_prompt, {"input1": item1, "input2": item2}
+            )
+            return [{"role": "user", "content": rendered}]
+
+        def oracle_predict(pair: tuple) -> tuple[bool, float]:
+            if self.runner.is_cancelled:
+                raise asyncio.CancelledError("Operation was cancelled")
+            item1, item2 = pair
+            is_match, cost, _prompt = self.compare_pair(
+                comparison_prompt,
+                oracle_model,
+                item1,
+                item2,
+                bkeys,
+                timeout_seconds=self.config.get("timeout", 120),
+                max_retries_per_timeout=self.config.get("max_retries_per_timeout", 2),
+            )
+            return bool(is_match), cost
+
+        result, cost = self._run_binary_cascade(
+            items=pair_items,
+            render_messages=render_messages,
+            proxy_labels=[True, False],
+            oracle_predict=oracle_predict,
+            default_guarantee="precision",
+            op_label="resolve",
+        )
+        return [bool(lbl) for lbl in result.labels], cost
+
     def syntax_check(self) -> None:
         context = {"_from_df_accessors": self.runner._from_df_accessors}
         super().syntax_check(context)
@@ -221,26 +327,77 @@ class ResolveOperation(BaseOperation):
         blocking_keys = self.config.get("blocking_keys", [])
         blocking_threshold = self.config.get("blocking_threshold")
         blocking_conditions = self.config.get("blocking_conditions", [])
+        limit_comparisons = self.config.get("limit_comparisons")
+        total_cost = 0
         if self.status:
             self.status.stop()
 
-        if not blocking_threshold and not blocking_conditions:
-            # Prompt the user for confirmation
-            if not Confirm.ask(
-                "[yellow]Warning: No blocking keys or conditions specified. "
-                "This may result in a large number of comparisons. "
-                "We recommend specifying at least one blocking key or condition, or using the optimizer to automatically come up with these. "
-                "Do you want to continue without blocking?[/yellow]",
-                console=self.runner.console,
-            ):
-                raise ValueError("Operation cancelled by user.")
+        # Track pre-computed embeddings from auto-optimization
+        precomputed_embeddings = None
+
+        # Auto-compute blocking threshold if no blocking configuration is provided
+        if (
+            not blocking_threshold
+            and not blocking_conditions
+            and not limit_comparisons
+            and len(input_data) > 10
+        ):
+            # Only auto-compute a blocking threshold at scale. For small inputs
+            # the sample is too tiny to estimate a reliable threshold, so we fall
+            # through and compare all pairs (cheap and deterministic).
+            # Get target recall from operation config (default 0.95)
+            target_recall = self.config.get("blocking_target_recall", 0.95)
+            self.console.log(
+                f"[yellow]No blocking configuration. Auto-computing threshold (target recall: {target_recall:.0%})...[/yellow]"
+            )
+            # Determine blocking keys if not set
+            auto_blocking_keys = blocking_keys if blocking_keys else None
+            if not auto_blocking_keys:
+                prompt_template = self.config.get("comparison_prompt", "")
+                auto_blocking_keys = (
+                    extract_comparison_field_reads(prompt_template) or []
+                )
+            if not auto_blocking_keys:
+                auto_blocking_keys = list(input_data[0].keys())
+            blocking_keys = auto_blocking_keys
+
+            # Create comparison function for threshold optimization
+            def compare_fn_for_optimization(item1, item2):
+                return self.compare_pair(
+                    self.config["comparison_prompt"],
+                    self.config.get("comparison_model", self.default_model),
+                    item1,
+                    item2,
+                    blocking_keys=[],  # Don't use key-based shortcut during optimization
+                    timeout_seconds=self.config.get("timeout", 120),
+                    max_retries_per_timeout=self.config.get(
+                        "max_retries_per_timeout", 2
+                    ),
+                )
+
+            # Run threshold optimization
+            optimizer = RuntimeBlockingOptimizer(
+                runner=self.runner,
+                config=self.config,
+                default_model=self.default_model,
+                max_threads=self.max_threads,
+                console=self.console,
+                target_recall=target_recall,
+                sample_size=min(100, len(input_data) * (len(input_data) - 1) // 4),
+            )
+            blocking_threshold, precomputed_embeddings, optimization_cost = (
+                optimizer.optimize_resolve(
+                    input_data,
+                    compare_fn_for_optimization,
+                    blocking_keys=blocking_keys,
+                )
+            )
+            total_cost += optimization_cost
 
         input_schema = self.config.get("input", {}).get("schema", {})
         if not blocking_keys:
             # Set them to all keys in the input data
             blocking_keys = list(input_data[0].keys())
-        limit_comparisons = self.config.get("limit_comparisons")
-        total_cost = 0
 
         def is_match(item1: dict[str, Any], item2: dict[str, Any]) -> bool:
             return any(
@@ -251,132 +408,140 @@ class ResolveOperation(BaseOperation):
         # Calculate embeddings if blocking_threshold is set
         embeddings = None
         if blocking_threshold is not None:
-
-            def get_embeddings_batch(
-                items: list[dict[str, Any]]
-            ) -> list[tuple[list[float], float]]:
+            # Use precomputed embeddings if available from auto-optimization
+            if precomputed_embeddings is not None:
+                embeddings = precomputed_embeddings
+            else:
+                self.console.log(
+                    f"[cyan]Creating embeddings for {len(input_data)} items...[/cyan]"
+                )
                 embedding_model = self.config.get(
                     "embedding_model", "text-embedding-3-small"
                 )
                 model_input_context_length = model_cost.get(embedding_model, {}).get(
                     "max_input_tokens", 8192
                 )
+                batch_size = self.config.get("embedding_batch_size", 1000)
+                embeddings = []
+                embedding_cost = 0.0
+                num_batches = (len(input_data) + batch_size - 1) // batch_size
 
-                texts = [
-                    " ".join(str(item[key]) for key in blocking_keys if key in item)[
-                        : model_input_context_length * 3
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, len(input_data))
+                    batch = input_data[start_idx:end_idx]
+
+                    if num_batches > 1:
+                        self.console.log(
+                            f"[dim]Creating embeddings: batch {batch_idx + 1}/{num_batches} "
+                            f"({end_idx}/{len(input_data)} items)[/dim]"
+                        )
+
+                    def _safe_lookup(item, key):
+                        try:
+                            return str(lookup_field(item, key))
+                        except Exception:
+                            return None
+
+                    texts = [
+                        " ".join(
+                            filter(
+                                None, (_safe_lookup(item, key) for key in blocking_keys)
+                            )
+                        )[: model_input_context_length * 3]
+                        for item in batch
                     ]
-                    for item in items
-                ]
+                    response = self.runner.api.gen_embedding(
+                        model=embedding_model, input=texts
+                    )
+                    embeddings.extend([data["embedding"] for data in response["data"]])
+                    embedding_cost += completion_cost(response)
 
-                response = self.runner.api.gen_embedding(
-                    model=embedding_model, input=texts
+                total_cost += embedding_cost
+
+        # Build a mapping of blocking key values to indices
+        # This is used later for cluster merging (when two items match, merge all items sharing their key values)
+        value_to_indices: dict[tuple[str, ...], list[int]] = {}
+        for i, item in enumerate(input_data):
+            key = tuple(str(item.get(k, "")) for k in blocking_keys)
+            if key not in value_to_indices:
+                value_to_indices[key] = []
+            value_to_indices[key].append(i)
+
+        # Total number of pairs to potentially compare
+        n = len(input_data)
+        total_pairs = n * (n - 1) // 2
+
+        # Apply code-based blocking conditions (check all pairs)
+        code_blocked_pairs = []
+        if blocking_conditions:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if is_match(input_data[i], input_data[j]):
+                        code_blocked_pairs.append((i, j))
+
+        # Apply cosine similarity blocking if threshold is specified
+        embedding_blocked_pairs = []
+        if blocking_threshold is not None and embeddings is not None:
+            import numpy as np
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            similarity_matrix = cosine_similarity(embeddings)
+            code_blocked_set = set(code_blocked_pairs)
+
+            # Use numpy to efficiently find all pairs above threshold
+            i_indices, j_indices = np.triu_indices(n, k=1)
+            similarities = similarity_matrix[i_indices, j_indices]
+            above_threshold_mask = similarities >= blocking_threshold
+
+            # Get pairs above threshold
+            above_threshold_i = i_indices[above_threshold_mask]
+            above_threshold_j = j_indices[above_threshold_mask]
+
+            # Filter out pairs already in code_blocked_set
+            embedding_blocked_pairs = [
+                (int(i), int(j))
+                for i, j in zip(above_threshold_i, above_threshold_j)
+                if (i, j) not in code_blocked_set
+            ]
+
+        # Combine pairs from both blocking methods
+        all_blocked_pairs = code_blocked_pairs + embedding_blocked_pairs
+
+        # If no blocking was applied, compare all pairs
+        if not blocking_conditions and blocking_threshold is None:
+            all_blocked_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        # Apply limit_comparisons with prioritization
+        if limit_comparisons is not None and len(all_blocked_pairs) > limit_comparisons:
+            # Prioritize code-based pairs, then sample from embedding pairs if needed
+            if len(code_blocked_pairs) >= limit_comparisons:
+                # If we have enough code-based pairs, just sample from those
+                blocked_pairs = random.sample(code_blocked_pairs, limit_comparisons)
+                self.console.log(
+                    f"Using {limit_comparisons} code-based pairs (had {len(code_blocked_pairs)} available)"
                 )
-                return [
-                    (data["embedding"], completion_cost(response))
-                    for data in response["data"]
-                ]
-
-            embeddings = []
-            costs = []
-            with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
-                for i in range(
-                    0, len(input_data), self.config.get("embedding_batch_size", 1000)
-                ):
-                    batch = input_data[
-                        i : i + self.config.get("embedding_batch_size", 1000)
-                    ]
-                    batch_results = list(executor.map(get_embeddings_batch, [batch]))
-
-                    for result in batch_results:
-                        embeddings.extend([r[0] for r in result])
-                        costs.extend([r[1] for r in result])
-
-                total_cost += sum(costs)
-
-        # Generate all pairs to compare, ensuring no duplicate comparisons
-        def get_unique_comparison_pairs() -> (
-            tuple[list[tuple[int, int]], dict[tuple[str, ...], list[int]]]
-        ):
-            # Create a mapping of values to their indices
-            value_to_indices: dict[tuple[str, ...], list[int]] = {}
-            for i, item in enumerate(input_data):
-                # Create a hashable key from the blocking keys
-                key = tuple(str(item.get(k, "")) for k in blocking_keys)
-                if key not in value_to_indices:
-                    value_to_indices[key] = []
-                value_to_indices[key].append(i)
-
-            # Generate pairs for comparison, comparing each unique value combination only once
-            comparison_pairs = []
-            keys = list(value_to_indices.keys())
-
-            # First, handle comparisons between different values
-            for i in range(len(keys)):
-                for j in range(i + 1, len(keys)):
-                    # Only need one comparison between different values
-                    idx1 = value_to_indices[keys[i]][0]
-                    idx2 = value_to_indices[keys[j]][0]
-                    if idx1 < idx2:  # Maintain ordering to avoid duplicates
-                        comparison_pairs.append((idx1, idx2))
-
-            return comparison_pairs, value_to_indices
-
-        comparison_pairs, value_to_indices = get_unique_comparison_pairs()
-
-        # Filter pairs based on blocking conditions
-        def meets_blocking_conditions(pair: tuple[int, int]) -> bool:
-            i, j = pair
-            return (
-                is_match(input_data[i], input_data[j]) if blocking_conditions else False
-            )
-
-        blocked_pairs = (
-            list(filter(meets_blocking_conditions, comparison_pairs))
-            if blocking_conditions
-            else comparison_pairs
-        )
-
-        # Apply limit_comparisons to blocked pairs
-        if limit_comparisons is not None and len(blocked_pairs) > limit_comparisons:
-            self.console.log(
-                f"Randomly sampling {limit_comparisons} pairs out of {len(blocked_pairs)} blocked pairs."
-            )
-            blocked_pairs = random.sample(blocked_pairs, limit_comparisons)
+            else:
+                # Take all code-based pairs + sample from embedding pairs
+                remaining_slots = limit_comparisons - len(code_blocked_pairs)
+                sampled_embedding_pairs = random.sample(
+                    embedding_blocked_pairs,
+                    min(remaining_slots, len(embedding_blocked_pairs)),
+                )
+                blocked_pairs = code_blocked_pairs + sampled_embedding_pairs
+                self.console.log(
+                    f"Using {len(code_blocked_pairs)} code-based + {len(sampled_embedding_pairs)} embedding-based pairs "
+                    f"(total: {len(blocked_pairs)})"
+                )
+        else:
+            blocked_pairs = all_blocked_pairs
+            if len(code_blocked_pairs) > 0 and len(embedding_blocked_pairs) > 0:
+                self.console.log(
+                    f"Using all {len(code_blocked_pairs)} code-based + {len(embedding_blocked_pairs)} embedding-based pairs"
+                )
 
         # Initialize clusters with all indices
         clusters = [{i} for i in range(len(input_data))]
         cluster_map = {i: i for i in range(len(input_data))}
-
-        # If there are remaining comparisons, fill with highest cosine similarities
-        remaining_comparisons = (
-            limit_comparisons - len(blocked_pairs)
-            if limit_comparisons is not None
-            else float("inf")
-        )
-        if remaining_comparisons > 0 and blocking_threshold is not None:
-            # Compute cosine similarity for all pairs efficiently
-            from sklearn.metrics.pairwise import cosine_similarity
-
-            similarity_matrix = cosine_similarity(embeddings)
-
-            cosine_pairs = []
-            for i, j in comparison_pairs:
-                if (i, j) not in blocked_pairs and find_cluster(
-                    i, cluster_map
-                ) != find_cluster(j, cluster_map):
-                    similarity = similarity_matrix[i, j]
-                    if similarity >= blocking_threshold:
-                        cosine_pairs.append((i, j, similarity))
-
-            if remaining_comparisons != float("inf"):
-                cosine_pairs.sort(key=lambda x: x[2], reverse=True)
-                additional_pairs = [
-                    (i, j) for i, j, _ in cosine_pairs[: int(remaining_comparisons)]
-                ]
-                blocked_pairs.extend(additional_pairs)
-            else:
-                blocked_pairs.extend((i, j) for i, j, _ in cosine_pairs)
 
         # Modified merge_clusters to handle all indices with the same value
 
@@ -412,18 +577,6 @@ class ResolveOperation(BaseOperation):
                             cluster_map[root_idx] = root1
                             clusters[root_idx] = set()
 
-        # Calculate and print statistics
-        total_possible_comparisons = len(input_data) * (len(input_data) - 1) // 2
-        comparisons_made = len(blocked_pairs)
-        comparisons_saved = total_possible_comparisons - comparisons_made
-        self.console.log(
-            f"[green]Comparisons saved by blocking: {comparisons_saved} "
-            f"({(comparisons_saved / total_possible_comparisons) * 100:.2f}%)[/green]"
-        )
-        self.console.log(
-            f"[blue]Number of pairs to compare: {len(blocked_pairs)}[/blue]"
-        )
-
         # Compute an auto-batch size based on the number of comparisons
         def auto_batch() -> int:
             # Maximum batch size limit for 4o-mini model
@@ -449,8 +602,27 @@ class ResolveOperation(BaseOperation):
 
         # Compare pairs and update clusters in real-time
         batch_size = self.config.get("compare_batch_size", auto_batch())
-        self.console.log(f"Using compare batch size: {batch_size}")
+
+        # Log blocking summary
+        total_possible_comparisons = len(input_data) * (len(input_data) - 1) // 2
+        self.console.log(
+            f"Comparing {len(blocked_pairs):,} pairs "
+            f"({len(blocked_pairs)/total_possible_comparisons*100:.1f}% of {total_possible_comparisons:,} total, "
+            f"batch size: {batch_size})"
+        )
         pair_costs = 0
+
+        if self.config.get("cascade"):
+            # Replace "oracle-compare every candidate pair" with the cascade:
+            # proxy on all pairs, oracle on a calibrated subset (precision
+            # guarantee by default). Merge matched pairs into the union-find,
+            # then empty the work list so the per-batch loop below no-ops.
+            pair_items = [(input_data[i], input_data[j]) for (i, j) in blocked_pairs]
+            labels, pair_costs = self._cascade_match_pairs(pair_items, blocking_keys)
+            for (i, j), is_match in zip(blocked_pairs, labels):
+                if is_match:
+                    merge_clusters(i, j)
+            blocked_pairs = []
 
         pbar = RichLoopBar(
             range(0, len(blocked_pairs), batch_size),
@@ -609,17 +781,17 @@ class ResolveOperation(BaseOperation):
                     )
                 return [], reduction_cost
             else:
-                # Set the output schema to be the keys found in the compare_prompt
-                compare_prompt_keys = extract_jinja_variables(
-                    self.config["comparison_prompt"]
-                )
-                # Get the set of keys in the compare_prompt
+                # Set the output schema to be the record fields the
+                # compare_prompt reads from input1. The legacy heuristic
+                # kept full dotted paths ("address.city"), which never
+                # match a record key below; the sound extractor yields
+                # the actual top-level field. None (whole-row prompt) →
+                # no mapping, same as finding no keys.
                 compare_prompt_keys = set(
-                    [
-                        k.replace("input1.", "")
-                        for k in compare_prompt_keys
-                        if "input1" in k
-                    ]
+                    extract_input_field_reads(
+                        self.config["comparison_prompt"], var="input1"
+                    )
+                    or []
                 )
 
                 # For each key in the output schema, find the most similar key in the compare_prompt

@@ -4,7 +4,9 @@ from .base_schemas import *  # noqa: F403
 # ruff: noqa: F403
 from .operations import (
     cluster,
+    code_operations,
     equijoin,
+    extract,
     filter,
     gather,
     map,
@@ -13,6 +15,8 @@ from .operations import (
     sample,
     split,
     unnest,
+    unnest_columns,
+    web_search,
 )
 
 MapOp = map.MapOperation.schema
@@ -24,8 +28,14 @@ EquijoinOp = equijoin.EquijoinOperation.schema
 SplitOp = split.SplitOperation.schema
 GatherOp = gather.GatherOperation.schema
 UnnestOp = unnest.UnnestOperation.schema
+UnnestColumnsOp = unnest_columns.UnnestColumnsOperation.schema
 ClusterOp = cluster.ClusterOperation.schema
 SampleOp = sample.SampleOperation.schema
+CodeMapOp = code_operations.CodeMapOperation.schema
+CodeReduceOp = code_operations.CodeReduceOperation.schema
+CodeFilterOp = code_operations.CodeFilterOperation.schema
+ExtractOp = extract.ExtractOperation.schema
+WebSearchOp = web_search.WebSearchOperation.schema
 
 OpType = (
     MapOp
@@ -37,6 +47,12 @@ OpType = (
     | SplitOp
     | GatherOp
     | UnnestOp
+    | UnnestColumnsOp
+    | CodeMapOp
+    | CodeReduceOp
+    | CodeFilterOp
+    | ExtractOp
+    | WebSearchOp
 )
 
-Dataset = dataset.Dataset.schema
+Dataset = dataset.DataLoader.schema

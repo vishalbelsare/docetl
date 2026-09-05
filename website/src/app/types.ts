@@ -18,12 +18,15 @@ export type Operation = {
     | "rank"
     | "extract"
     | "unnest"
+    | "unnest_columns"
     | "split"
     | "gather"
     | "sample"
     | "code_map"
     | "code_reduce"
-    | "code_filter";
+    | "code_filter"
+    | "web_fetch"
+    | "web_search";
   name: string;
   prompt?: string;
   output?: { schema: SchemaItem[] };
@@ -104,6 +107,7 @@ export interface OptimizeResult {
   should_optimize?: string;
   input_data?: Array<Record<string, unknown>>;
   output_data?: Array<Record<string, unknown>>;
+  num_docs_analyzed?: number;
   cost?: number;
   error?: string;
   created_at: string;
@@ -113,4 +117,25 @@ export interface OptimizeResult {
 export interface APIKey {
   name: string;
   value: string;
+}
+
+export interface DecomposeRequest {
+  yaml_config: string;
+  step_name: string;
+  op_name: string;
+}
+
+export interface DecomposeResult {
+  task_id: string;
+  status: TaskStatus;
+  decomposed_operations?: Array<Record<string, unknown>>;
+  winning_directive?: string;
+  candidates_evaluated?: number;
+  original_outputs?: Array<Record<string, unknown>>;
+  decomposed_outputs?: Array<Record<string, unknown>>;
+  comparison_rationale?: string;
+  cost?: number;
+  error?: string;
+  created_at: string;
+  completed_at?: string;
 }

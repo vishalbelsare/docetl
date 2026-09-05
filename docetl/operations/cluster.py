@@ -4,12 +4,41 @@ from typing import Any
 import numpy as np
 from jinja2 import Template
 
-from .base import BaseOperation
+from docetl.utils import ensure_non_jinja_prompt_confirmed, has_jinja_syntax
+
+from .base import BaseOperation, Cardinality
 from .clustering_utils import get_embeddings_for_clustering
 from .utils import RichLoopBar, strict_render
 
 
 class ClusterOperation(BaseOperation):
+    @classmethod
+    def transform_schema(cls, schema, config):
+        result = super().transform_schema(schema, config)
+        result[config.get("output_key", "clusters")] = "list"
+        return result
+
+    # ── plan traits ────────────────────────────────────────────────
+    # Annotates every row in place (order kept) but cluster assignments
+    # depend on the whole dataset, so not row-local. fields_read stays
+    # None: summaries render whole cluster members.
+
+    @classmethod
+    def cardinality(cls, config):
+        return Cardinality.ONE_TO_ONE
+
+    @classmethod
+    def fields_written(cls, config):
+        return frozenset({config.get("output_key", "clusters")})
+
+    @classmethod
+    def is_llm(cls, config):
+        return True
+
+    @classmethod
+    def preserves_order(cls, config):
+        return True
+
     def __init__(
         self,
         *args,
@@ -18,6 +47,14 @@ class ClusterOperation(BaseOperation):
         super().__init__(*args, **kwargs)
         self.max_batch_size: int = self.config.get(
             "max_batch_size", kwargs.get("max_batch_size", float("inf"))
+        )
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "summary_prompt",
+            "_append_document_to_prompt",
+            console=self.console,
+            status=self.status,
+            extra_flags={"_is_reduce_operation": True},
         )
 
     def syntax_check(self) -> None:
@@ -48,11 +85,16 @@ class ClusterOperation(BaseOperation):
         if not isinstance(self.config["summary_prompt"], str):
             raise TypeError("'prompt' must be a string")
 
-        # Check if the prompt is a valid Jinja2 template
-        try:
-            Template(self.config["summary_prompt"])
-        except Exception as e:
-            raise ValueError(f"Invalid Jinja2 template in 'prompt': {str(e)}")
+        # Check if the prompt has Jinja syntax
+        if not has_jinja_syntax(self.config["summary_prompt"]):
+            # This will be handled during initialization with user confirmation
+            pass
+        else:
+            # Check if the prompt is a valid Jinja2 template
+            try:
+                Template(self.config["summary_prompt"])
+            except Exception as e:
+                raise ValueError(f"Invalid Jinja2 template in 'prompt': {str(e)}")
 
         # Check optional parameters
         if "max_batch_size" in self.config:
@@ -84,11 +126,11 @@ class ClusterOperation(BaseOperation):
         Args:
             input_data (list[dict]): A list of dictionaries to process.
             is_build (bool): Whether the operation is being executed
-              in the build phase. Defaults to False.
+                in the build phase. Defaults to False.
 
         Returns:
             tuple[list[dict], float]: A tuple containing the clustered
-              list of dictionaries and the total cost of the operation.
+                list of dictionaries and the total cost of the operation.
         """
         if not input_data:
             return input_data, 0

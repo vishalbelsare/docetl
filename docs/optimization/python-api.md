@@ -1,87 +1,125 @@
 # Optimizing Pipelines with the Python API
 
-You may have your pipelines defined in Python instead of YAML and want to optimize them. Here's an example of how to use the Python API to define, optimize, and run a document processing pipeline similar to the medical transcripts example we saw earlier.
+Use `.optimize()` to find cost-accuracy trade-offs for your pipeline. MOAR explores different configurations (models, validation steps, operation rewrites) and returns a frontier of optimized pipelines.
+
+## Quick Example
 
 ```python
-from docetl.api import Pipeline, Dataset, MapOp, UnnestOp, ResolveOp, ReduceOp, PipelineStep, PipelineOutput
+import docetl
 
-# Define datasets
-datasets = {
-    "transcripts": Dataset(type="file", path="medical_transcripts.json"),
-}
+docetl.default_model = "gpt-4o-mini"
 
-# Define operations
-operations = [
-    MapOp(
-        name="extract_medications",
-        type="map",
-        optimize=True,  # This operation will be optimized
-        output={"schema": {"medication": "list[str]"}},
+frame = (
+    docetl.read_json("medical_transcripts.json")
+    .map(
         prompt="Analyze the transcript: {{ input.src }}\nList all medications mentioned.",
-    ),
-    UnnestOp(
-        name="unnest_medications",
-        type="unnest",
-        unnest_key="medication"
-    ),
-    ResolveOp(
-        name="resolve_medications",
-        type="resolve",
-        blocking_keys=["medication"],
-        optimize=True,  # This operation will be optimized
-        output={"schema": {"medication": "str"}},
-        comparison_prompt="Compare medications:\n1: {{ input1.medication }}\n2: {{ input2.medication }}\nAre these the same or closely related?",
-        resolution_prompt="Standardize the name for:\n{% for entry in inputs %}\n- {{ entry.medication }}\n{% endfor %}"
-    ),
-    ReduceOp(
-        name="summarize_prescriptions",
-        type="reduce",
-        reduce_key=["medication"],
-        output={"schema": {"side_effects": "str", "uses": "str"}},
-        prompt="Summarize side effects and uses of {{ reduce_key }} from:\n{% for value in inputs %}\nTranscript {{ loop.index }}: {{ value.src }}\n{% endfor %}",
-        optimize=True,  # This operation will be optimized
+        output={"schema": {"medication": "list[str]"}},
     )
-]
-
-# Define pipeline steps
-steps = [
-    PipelineStep(name="medical_info_extraction", input="transcripts", operations=["extract_medications", "unnest_medications", "resolve_medications", "summarize_prescriptions"])
-]
-
-# Define pipeline output
-output = PipelineOutput(type="file", path="medication_summaries.json")
-
-# Create the pipeline
-pipeline = Pipeline(
-    name="medical_transcripts_pipeline",
-    datasets=datasets,
-    operations=operations,
-    steps=steps,
-    output=output,
-    default_model="gpt-4o-mini",
-    system_prompt={
-        "dataset_description": "a collection of medical conversation transcripts",
-        "persona": "a healthcare analyst extracting and summarizing medication information",
-    }
 )
 
-# Optimize the pipeline
-optimized_pipeline = pipeline.optimize(model="gpt-4o-mini")
+# Define your evaluation function
+@docetl.register_eval
+def evaluate(results):
+    correct = sum(
+        1 for r in results
+        for med in r.get("medication", [])
+        if med.lower() in r.get("src", "").lower()
+    )
+    return {"medication_extraction_score": correct}
+
+# Optimize — models auto-detected from API keys
+optimized = frame.optimize(
+    eval_fn=evaluate,
+    metric_key="medication_extraction_score",
+)
 
 # Run the optimized pipeline
-result = optimized_pipeline.run()
+rows = optimized.collect()
+print(f"Cost: ${optimized.total_cost:.4f}")
 
-print(f"Pipeline execution completed. Total cost: ${result:.2f}")
+# Inspect the Pareto frontier
+print(optimized.search_results.to_df())
 ```
 
-This example demonstrates how to create a pipeline that processes medical transcripts, extracts medication information, resolves similar medications, and summarizes prescription details.
+## Evaluation Function
 
-!!! note "Optimization"
+Pass any callable that takes the results list and returns a dict of metrics:
 
-    Notice that some operations have `optimize=True` set. DocETL will only optimize operations with this flag set to `True`. In this example, the `extract_medications`, `resolve_medications`, and `summarize_prescriptions` operations will be optimized.
+```python
+@docetl.register_eval
+def evaluate(results):
+    correct = sum(
+        1 for r in results
+        for med in r.get("medication", [])
+        if med.lower() in r.get("src", "").lower()
+    )
+    return {"medication_extraction_score": correct}
 
-!!! tip "Optimization Model"
+optimized = frame.optimize(eval_fn=evaluate, metric_key="medication_extraction_score")
+```
 
-    We use `pipeline.optimize(model="gpt-4o-mini")` to optimize the pipeline using the GPT-4o-mini model for the agents. This allows you to specify which model to use for optimization, which can be particularly useful when you want to balance between performance and cost.
+!!! tip "File paths for CLI"
+    The CLI uses file-based evaluation via `@register_eval`. See the [Evaluation Functions guide](moar/evaluation.md) for that workflow.
 
-The pipeline is optimized before execution to improve performance and accuracy. By setting `optimize=True` for specific operations, you have fine-grained control over which parts of your pipeline undergo optimization.
+## Configuration Options
+
+All parameters beyond `eval_fn` and `metric_key` are optional:
+
+```python
+optimized = frame.optimize(
+    eval_fn=evaluate,                    # Your evaluation function
+    metric_key="score",                  # Key in eval_fn's return dict to optimize
+    models=["gpt-4o", "gpt-4o-mini"],   # Override auto-detection
+    agent_model="gpt-4o",               # Override auto-selection (or set docetl.agent_model)
+    max_iterations=40,                   # Search budget (default: 20)
+    save_dir="./moar_results",           # Where to save results (default: temp dir)
+    exploration_weight=1.414,            # UCB exploration constant
+    dataset_path="data/sample.json",     # Sample dataset for optimization (default: full dataset)
+    max_threads=8,                       # Max concurrent LLM calls per pipeline run
+    max_concurrent_agents=3,             # Parallel MCTS search agents (default: 3)
+)
+```
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `eval_fn` | Callable that scores pipeline output. Takes a results file path and returns a dict of metrics. | **Required** |
+| `metric_key` | Which key from `eval_fn`'s return dict to use as the optimization metric. | **Required** |
+| `models` | List of LiteLLM model names to explore. | Auto-detected from API keys |
+| `agent_model` | Model for the MOAR rewrite agent. | Auto-selected best available (or `docetl.agent_model`) |
+| `max_iterations` | Number of MCTS search iterations. Higher = more exploration. | `20` |
+| `save_dir` | Directory to save optimized pipelines and results. | Temp directory |
+| `exploration_weight` | UCB exploration constant. Higher values explore more; lower values exploit. | `1.414` |
+| `dataset_path` | Path to a sample dataset for optimization (avoids optimizing on your full/test set). | Uses the pipeline's dataset |
+| `max_threads` | Max concurrent LLM calls for each pipeline execution during search. | `docetl.max_threads` or `cpu_count * 4` |
+| `max_concurrent_agents` | Number of parallel MCTS search agents. Each agent explores a different part of the search tree. | `3` |
+
+See the [Configuration Reference](moar/configuration.md) for details.
+
+## Working with Results
+
+```python
+optimized = frame.optimize(eval_fn=evaluate, metric_key="score")
+
+# The optimized frame is ready to run
+rows = optimized.collect()
+
+# Access the full MOAR search results
+results = optimized.search_results
+
+# Best accuracy on the frontier
+best = results.best()
+print(f"Best accuracy: {best.accuracy}, cost: ${best.cost:.4f}")
+
+# Cheapest option on the frontier
+cheap = results.cheapest()
+print(f"Cheapest cost: ${cheap.cost:.4f}, accuracy: {cheap.accuracy:.4f}")
+
+# Browse the full frontier
+for plan in results.frontier:
+    print(f"Cost: ${plan.cost:.4f}, Accuracy: {plan.accuracy:.4f}")
+
+# Analyze as a DataFrame
+print(results.to_df())
+```
+
+See [Understanding Results](moar/results.md) for more details.

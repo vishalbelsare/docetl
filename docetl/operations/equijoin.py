@@ -2,12 +2,13 @@
 The `EquijoinOperation` class is a subclass of `BaseOperation` that performs an equijoin operation on two datasets. It uses a combination of blocking techniques and LLM-based comparisons to efficiently join the datasets.
 """
 
+import asyncio
 import json
 import random
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Pool, cpu_count
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 from litellm import model_cost
@@ -17,8 +18,14 @@ from rich.prompt import Confirm
 
 from docetl.operations.base import BaseOperation
 from docetl.operations.utils import strict_render
+from docetl.operations.utils.blocking import RuntimeBlockingOptimizer
+from docetl.operations.utils.cascade_runner import CascadeConfig, CascadeMixin
 from docetl.operations.utils.progress import RichLoopBar
-from docetl.utils import completion_cost
+from docetl.utils import (
+    completion_cost,
+    ensure_non_jinja_prompt_confirmed,
+    has_jinja_syntax,
+)
 
 # Global variables to store shared data
 _right_data = None
@@ -53,15 +60,17 @@ def process_left_item(
     ]
 
 
-class EquijoinOperation(BaseOperation):
+class EquijoinOperation(BaseOperation, CascadeMixin):
     class schema(BaseOperation.schema):
         type: str = "equijoin"
         comparison_prompt: str
         output: dict[str, Any] | None = None
         blocking_threshold: float | None = None
+        blocking_target_recall: float | None = None
         blocking_conditions: list[str] | None = None
         limits: dict[str, int] | None = None
         comparison_model: str | None = None
+        cascade: Optional[CascadeConfig] = None
         optimize: bool | None = None
         embedding_model: str | None = None
         embedding_batch_size: int | None = None
@@ -88,6 +97,43 @@ class EquijoinOperation(BaseOperation):
                         "Both 'left' and 'right' must be specified in 'limits'"
                     )
             return v
+
+        @field_validator("comparison_prompt")
+        def validate_comparison_prompt(cls, v):
+            # Check if it has Jinja syntax
+            if not has_jinja_syntax(v):
+                # This will be handled during initialization with user confirmation
+                return v
+            # If it has Jinja syntax, validate it's a valid template
+            from jinja2 import Template
+
+            try:
+                Template(v)
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid Jinja2 template in 'comparison_prompt': {str(e)}"
+                )
+            return v
+
+    # ── plan traits ────────────────────────────────────────────────
+    # Two-input join: rewrite rules treat it as an immovable boundary,
+    # so only the cost trait matters. The single-input fields_read/
+    # fields_written contracts don't apply; both stay None.
+
+    @classmethod
+    def is_llm(cls, config):
+        return True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Note: equijoin uses left and right; strict_render appends both.
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "comparison_prompt",
+            "_append_document_to_comparison_prompt",
+            console=self.console,
+            status=self.status,
+        )
 
     def compare_pair(
         self,
@@ -139,6 +185,51 @@ class EquijoinOperation(BaseOperation):
             self.console.log(f"[red]Error parsing LLM response: {e}[/red]")
             return False, cost
         return output["is_match"], cost
+
+    def _cascade_match_pairs(self, pair_items: list) -> "tuple[list[bool], float]":
+        """Decide ``is_match`` for each candidate pair via the model cascade.
+
+        ``pair_items`` is the list of ``(left, right)`` dict tuples (in
+        ``blocked_pairs`` order). Returns per-pair match decisions and total
+        cost. Proxy is a single-token logprob compare; oracle is the existing
+        :meth:`compare_pair`. Default guarantee is ``precision``.
+        """
+        if not pair_items:
+            return [], 0.0
+
+        comparison_prompt = self.config["comparison_prompt"]
+        oracle_model = self.config.get("comparison_model", self.default_model)
+
+        def render_messages(pair: tuple) -> list[dict[str, str]]:
+            left_item, right_item = pair
+            rendered = strict_render(
+                comparison_prompt, {"left": left_item, "right": right_item}
+            )
+            return [{"role": "user", "content": rendered}]
+
+        def oracle_predict(pair: tuple) -> tuple[bool, float]:
+            if self.runner.is_cancelled:
+                raise asyncio.CancelledError("Operation was cancelled")
+            left_item, right_item = pair
+            is_match_label, cost = self.compare_pair(
+                comparison_prompt,
+                oracle_model,
+                left_item,
+                right_item,
+                self.config.get("timeout", 120),
+                self.config.get("max_retries_per_timeout", 2),
+            )
+            return bool(is_match_label), cost
+
+        result, cost = self._run_binary_cascade(
+            items=pair_items,
+            render_messages=render_messages,
+            proxy_labels=[True, False],
+            oracle_predict=oracle_predict,
+            default_guarantee="precision",
+            op_label="equijoin",
+        )
+        return [bool(lbl) for lbl in result.labels], cost
 
     def execute(
         self, left_data: list[dict], right_data: list[dict]
@@ -211,6 +302,74 @@ class EquijoinOperation(BaseOperation):
         if self.status:
             self.status.stop()
 
+        # Track pre-computed embeddings from auto-optimization
+        precomputed_left_embeddings = None
+        precomputed_right_embeddings = None
+
+        # Small joins: comparing every pair is cheap and reliable, whereas
+        # auto-blocking estimates a similarity threshold from a tiny random
+        # sample and can pick an unstable value that drops true matches. Skip
+        # blocking and compare all pairs.
+        if (
+            not blocking_threshold
+            and not blocking_conditions
+            and not limit_comparisons
+            and len(left_data) * len(right_data) <= 100
+        ):
+            blocking_conditions = ["True"]
+            self.console.log(
+                f"[yellow]Small join ({len(left_data) * len(right_data)} pairs); "
+                "comparing all pairs without blocking.[/yellow]"
+            )
+
+        # Auto-compute blocking threshold if no blocking configuration is provided
+        if not blocking_threshold and not blocking_conditions and not limit_comparisons:
+            # Get target recall from operation config (default 0.95)
+            target_recall = self.config.get("blocking_target_recall", 0.95)
+            self.console.log(
+                f"[yellow]No blocking configuration. Auto-computing threshold (target recall: {target_recall:.0%})...[/yellow]"
+            )
+
+            # Create comparison function for threshold optimization
+            def compare_fn_for_optimization(left_item, right_item):
+                return self.compare_pair(
+                    self.config["comparison_prompt"],
+                    self.config.get("comparison_model", self.default_model),
+                    left_item,
+                    right_item,
+                    timeout_seconds=self.config.get("timeout", 120),
+                    max_retries_per_timeout=self.config.get(
+                        "max_retries_per_timeout", 2
+                    ),
+                )
+
+            # Run threshold optimization
+            optimizer = RuntimeBlockingOptimizer(
+                runner=self.runner,
+                config=self.config,
+                default_model=self.default_model,
+                max_threads=self.max_threads,
+                console=self.console,
+                target_recall=target_recall,
+                sample_size=min(100, len(left_data) * len(right_data) // 4),
+            )
+            (
+                blocking_threshold,
+                precomputed_left_embeddings,
+                precomputed_right_embeddings,
+                optimization_cost,
+            ) = optimizer.optimize_equijoin(
+                left_data,
+                right_data,
+                compare_fn_for_optimization,
+                left_keys=left_keys,
+                right_keys=right_keys,
+            )
+            total_cost += optimization_cost
+            self.console.log(
+                f"[green]Using auto-computed blocking threshold: {blocking_threshold}[/green]"
+            )
+
         # Initial blocking using multiprocessing
         num_processes = min(cpu_count(), len(left_data))
 
@@ -259,45 +418,64 @@ class EquijoinOperation(BaseOperation):
         )
 
         if blocking_threshold is not None:
-            embedding_model = self.config.get("embedding_model", self.default_model)
-            model_input_context_length = model_cost.get(embedding_model, {}).get(
-                "max_input_tokens", 8192
-            )
-
-            def get_embeddings(
-                input_data: list[dict[str, Any]], keys: list[str], name: str
-            ) -> tuple[list[list[float]], float]:
-                texts = [
-                    " ".join(str(item[key]) for key in keys if key in item)[
-                        : model_input_context_length * 4
-                    ]
-                    for item in input_data
-                ]
-
-                embeddings = []
-                total_cost = 0
+            # Use precomputed embeddings if available from auto-optimization
+            if (
+                precomputed_left_embeddings is not None
+                and precomputed_right_embeddings is not None
+            ):
+                left_embeddings = precomputed_left_embeddings
+                right_embeddings = precomputed_right_embeddings
+            else:
+                # Never fall back to the chat default_model here — embedding
+                # endpoints reject chat models.
+                embedding_model = self.config.get(
+                    "embedding_model", "text-embedding-3-small"
+                )
+                model_input_context_length = model_cost.get(embedding_model, {}).get(
+                    "max_input_tokens", 8192
+                )
                 batch_size = 2000
-                for i in range(0, len(texts), batch_size):
-                    batch = texts[i : i + batch_size]
-                    self.console.log(
-                        f"On iteration {i} for creating embeddings for {name} data"
-                    )
-                    response = self.runner.api.gen_embedding(
-                        model=embedding_model,
-                        input=batch,
-                    )
-                    embeddings.extend([data["embedding"] for data in response["data"]])
-                    total_cost += completion_cost(response)
-                return embeddings, total_cost
 
-            left_embeddings, left_cost = get_embeddings(left_data, left_keys, "left")
-            right_embeddings, right_cost = get_embeddings(
-                right_data, right_keys, "right"
-            )
-            total_cost += left_cost + right_cost
-            self.console.log(
-                f"Created embeddings for datasets. Total embedding creation cost: {total_cost}"
-            )
+                def get_embeddings(
+                    input_data: list[dict[str, Any]], keys: list[str], name: str
+                ) -> tuple[list[list[float]], float]:
+                    texts = [
+                        " ".join(str(item[key]) for key in keys if key in item)[
+                            : model_input_context_length * 4
+                        ]
+                        for item in input_data
+                    ]
+                    embeddings = []
+                    embedding_cost = 0
+                    num_batches = (len(texts) + batch_size - 1) // batch_size
+
+                    for batch_idx, i in enumerate(range(0, len(texts), batch_size)):
+                        batch = texts[i : i + batch_size]
+                        if num_batches > 1:
+                            self.console.log(
+                                f"[dim]Creating {name} embeddings: batch {batch_idx + 1}/{num_batches} "
+                                f"({min(i + batch_size, len(texts))}/{len(texts)} items)[/dim]"
+                            )
+                        response = self.runner.api.gen_embedding(
+                            model=embedding_model,
+                            input=batch,
+                        )
+                        embeddings.extend(
+                            [data["embedding"] for data in response["data"]]
+                        )
+                        embedding_cost += completion_cost(response)
+                    return embeddings, embedding_cost
+
+                self.console.log(
+                    f"[cyan]Creating embeddings for {len(left_data)} left + {len(right_data)} right items...[/cyan]"
+                )
+                left_embeddings, left_cost = get_embeddings(
+                    left_data, left_keys, "left"
+                )
+                right_embeddings, right_cost = get_embeddings(
+                    right_data, right_keys, "right"
+                )
+                total_cost += left_cost + right_cost
 
             # Compute all cosine similarities in one call
             from sklearn.metrics.pairwise import cosine_similarity
@@ -400,6 +578,35 @@ class EquijoinOperation(BaseOperation):
 
         if self.status:
             self.status.stop()
+
+        if self.config.get("cascade"):
+            # Run the cascade over the candidate pairs (already (left, right)
+            # dict tuples): proxy on all, oracle on a calibrated subset
+            # (precision guarantee by default). Emit joins for matched pairs,
+            # then empty the work list so the per-pair loop below no-ops.
+            labels, comparison_costs = self._cascade_match_pairs(blocked_pairs)
+            for (left_item, right_item), is_match_label in zip(blocked_pairs, labels):
+                if not is_match_label:
+                    continue
+                left_key_hash = get_hashable_key(left_item)
+                right_key_hash = get_hashable_key(right_item)
+                if (
+                    left_match_counts[left_key_hash] >= left_limit
+                    or right_match_counts[right_key_hash] >= right_limit
+                ):
+                    continue
+                joined_item = {}
+                for key, value in left_item.items():
+                    joined_item[f"{key}_left" if key in right_item else key] = value
+                for key, value in right_item.items():
+                    joined_item[f"{key}_right" if key in left_item else key] = value
+                if self.runner.api.validate_output(
+                    self.config, joined_item, self.console
+                ):
+                    results.append(joined_item)
+                    left_match_counts[left_key_hash] += 1
+                    right_match_counts[right_key_hash] += 1
+            blocked_pairs = []
 
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
             future_to_pair = {

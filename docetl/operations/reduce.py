@@ -17,18 +17,28 @@ from typing import Any
 import jinja2
 import numpy as np
 from jinja2 import Template
+from litellm.utils import ModelResponse
 from pydantic import Field, field_validator, model_validator
 
-from docetl.operations.base import BaseOperation
+from docetl.operations.base import BaseOperation, Cardinality
 from docetl.operations.clustering_utils import (
     cluster_documents,
     get_embeddings_for_clustering,
 )
-from docetl.operations.utils import rich_as_completed, strict_render
+from docetl.operations.utils import (
+    lookup_field,
+    rich_as_completed,
+    strict_render,
+    validate_output_types,
+)
 
 # Import OutputMode enum for structured output checks
 from docetl.operations.utils.api import OutputMode
-from docetl.utils import completion_cost
+from docetl.utils import (
+    completion_cost,
+    ensure_non_jinja_prompt_confirmed,
+    has_jinja_syntax,
+)
 
 
 class ReduceOperation(BaseOperation):
@@ -58,11 +68,17 @@ class ReduceOperation(BaseOperation):
         verbose: bool | None = None
         timeout: int | None = None
         litellm_completion_kwargs: dict[str, Any] = Field(default_factory=dict)
+        agent: Any | None = None
         enable_observability: bool = False
+        limit: int | None = Field(None, gt=0)
 
         @field_validator("prompt")
         def validate_prompt(cls, v):
             if v is not None:
+                # Check if it has Jinja syntax
+                if not has_jinja_syntax(v):
+                    # This will be handled during initialization with user confirmation
+                    return v
                 try:
                     template = Template(v)
                     template_vars = template.environment.parse(v).find_all(
@@ -80,6 +96,10 @@ class ReduceOperation(BaseOperation):
         @field_validator("fold_prompt")
         def validate_fold_prompt(cls, v):
             if v is not None:
+                # Check if it has Jinja syntax
+                if not has_jinja_syntax(v):
+                    # This will be handled during initialization with user confirmation
+                    return v
                 try:
                     fold_template = Template(v)
                     fold_template_vars = fold_template.environment.parse(v).find_all(
@@ -100,6 +120,10 @@ class ReduceOperation(BaseOperation):
         @field_validator("merge_prompt")
         def validate_merge_prompt(cls, v):
             if v is not None:
+                # Check if it has Jinja syntax
+                if not has_jinja_syntax(v):
+                    # This will be handled during initialization with user confirmation
+                    return v
                 try:
                     merge_template = Template(v)
                     merge_template_vars = merge_template.environment.parse(v).find_all(
@@ -138,6 +162,8 @@ class ReduceOperation(BaseOperation):
 
         @model_validator(mode="after")
         def validate_complex_requirements(self):
+            if self.agent is not None and self.gleaning is not None:
+                raise ValueError("Agentic operations cannot be combined with gleaning")
             # Check dependencies between merge_prompt and fold_prompt
             if self.merge_prompt and not self.fold_prompt:
                 raise ValueError(
@@ -156,14 +182,21 @@ class ReduceOperation(BaseOperation):
 
             return self
 
-    def __init__(self, *args, **kwargs):
-        """
-        Initialize the ReduceOperation.
+    # ── plan traits ────────────────────────────────────────────────
+    # fields_read/fields_written stay at the conservative None default:
+    # reduce prompts render whole grouped rows (``{{ inputs }}``) and
+    # output rows are reshaped wholesale.
 
-        Args:
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
-        """
+    @classmethod
+    def cardinality(cls, config: dict[str, Any]) -> Cardinality:
+        return Cardinality.MANY_TO_ONE
+
+    @classmethod
+    def is_llm(cls, config: dict[str, Any]) -> bool:
+        return True
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the ReduceOperation."""
         super().__init__(*args, **kwargs)
         self.min_samples = 5
         self.max_samples = 1000
@@ -177,6 +210,30 @@ class ReduceOperation(BaseOperation):
         )
         self.intermediates = {}
         self.lineage_keys = self.config.get("output", {}).get("lineage", [])
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "prompt",
+            "_append_document_to_prompt",
+            console=self.console,
+            status=self.status,
+            extra_flags={"_is_reduce_operation": True},
+        )
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "fold_prompt",
+            "_append_document_to_fold_prompt",
+            console=self.console,
+            status=self.status,
+            extra_flags={"_is_reduce_operation": True},
+        )
+        ensure_non_jinja_prompt_confirmed(
+            self.config,
+            "merge_prompt",
+            "_append_document_to_merge_prompt",
+            console=self.console,
+            status=self.status,
+            extra_flags={"_is_reduce_operation": True},
+        )
 
     def execute(self, input_data: list[dict]) -> tuple[list[dict], float]:
         """
@@ -212,7 +269,7 @@ class ReduceOperation(BaseOperation):
             def get_group_key(item):
                 key_values = []
                 for key in reduce_keys:
-                    value = item[key]
+                    value = lookup_field(item, key)
                     # Special handling for list-type values
                     if isinstance(value, list):
                         key_values.append(
@@ -232,6 +289,12 @@ class ReduceOperation(BaseOperation):
             # Convert the grouped data to a list of tuples
             grouped_data = list(grouped_data.items())
 
+        limit_value = self.config.get("limit")
+        if limit_value is not None:
+            # Sort by group size (smallest first) and take the limit
+            grouped_data = sorted(grouped_data, key=lambda x: len(x[1]))
+            grouped_data = grouped_data[:limit_value]
+
         def process_group(
             key: tuple, group_elems: list[dict]
         ) -> tuple[dict | None, float]:
@@ -244,6 +307,16 @@ class ReduceOperation(BaseOperation):
                 group_list = group_elems
 
             total_cost = 0.0
+            # Build retrieval context once per group
+            try:
+                retrieval_context = self._maybe_build_retrieval_context(
+                    {
+                        "reduce_key": dict(zip(self.config["reduce_key"], key)),
+                        "inputs": group_list,
+                    }
+                )
+            except Exception:
+                retrieval_context = "No extra context available."
 
             # Apply value sampling if enabled
             value_sampling = self.config.get("value_sampling", {})
@@ -273,18 +346,26 @@ class ReduceOperation(BaseOperation):
 
             # Only execute merge-based plans if associative = True
             if "merge_prompt" in self.config and self.config.get("associative", True):
-                result, prompts, cost = self._parallel_fold_and_merge(key, group_list)
+                result, prompts, cost = self._parallel_fold_and_merge(
+                    key, group_list, retrieval_context
+                )
             elif self.config.get("fold_batch_size", None) and self.config.get(
                 "fold_batch_size"
             ) >= len(group_list):
                 # If the fold batch size is greater than or equal to the number of items in the group,
                 # we can just run a single fold operation
-                result, prompt, cost = self._batch_reduce(key, group_list)
+                result, prompt, cost = self._batch_reduce(
+                    key, group_list, None, retrieval_context
+                )
                 prompts = [prompt]
             elif "fold_prompt" in self.config:
-                result, prompts, cost = self._incremental_reduce(key, group_list)
+                result, prompts, cost = self._incremental_reduce(
+                    key, group_list, retrieval_context
+                )
             else:
-                result, prompt, cost = self._batch_reduce(key, group_list)
+                result, prompt, cost = self._batch_reduce(
+                    key, group_list, None, retrieval_context
+                )
                 prompts = [prompt]
 
             total_cost += cost
@@ -295,6 +376,16 @@ class ReduceOperation(BaseOperation):
             if self.config.get("enable_observability", False):
                 # Add the _observability_{self.config['name']} key to the result
                 result[f"_observability_{self.config['name']}"] = {"prompts": prompts}
+
+            # Add retrieved context if save_retriever_output is enabled
+            if self.config.get("save_retriever_output", False):
+                ctx = (
+                    retrieval_context
+                    if retrieval_context
+                    and retrieval_context != "No extra context available."
+                    else ""
+                )
+                result[f"_{self.config['name']}_retrieved_context"] = ctx
 
             # Apply pass-through at the group level
             if (
@@ -337,6 +428,9 @@ class ReduceOperation(BaseOperation):
                 total_cost += item_cost
                 if output is not None:
                     results.append(output)
+
+        if limit_value is not None and len(results) > limit_value:
+            results = results[:limit_value]
 
         if self.config.get("persist_intermediates", False):
             for result in results:
@@ -414,7 +508,7 @@ class ReduceOperation(BaseOperation):
         return [group_list[i] for i in top_k_indices], cost
 
     def _parallel_fold_and_merge(
-        self, key: tuple, group_list: list[dict]
+        self, key: tuple, group_list: list[dict], retrieval_context: str
     ) -> tuple[dict | None, float]:
         """
         Perform parallel folding and merging on a group of items.
@@ -579,7 +673,7 @@ class ReduceOperation(BaseOperation):
         )
 
     def _incremental_reduce(
-        self, key: tuple, group_list: list[dict]
+        self, key: tuple, group_list: list[dict], retrieval_context: str
     ) -> tuple[dict | None, list[str], float]:
         """
         Perform an incremental reduce operation on a group of items.
@@ -653,14 +747,39 @@ class ReduceOperation(BaseOperation):
             self.config.get("output", {}).get("mode")
             == OutputMode.STRUCTURED_OUTPUT.value
         )
-        output = self.runner.api.parse_llm_response(
-            response,
-            schema=self.config["output"]["schema"],
-            use_structured_output=structured_mode,
-        )[0]
+        output = (
+            self.runner.api.parse_llm_response(
+                response,
+                schema=self.config["output"]["schema"],
+                use_structured_output=structured_mode,
+            )[0]
+            if isinstance(response, ModelResponse)
+            else response
+        )
+        # Enforce type validation against output schema
+        is_types_valid, _errors = validate_output_types(
+            output,
+            self.config["output"]["schema"],
+        )
+        if not is_types_valid:
+            return output, False
         if self.runner.api.validate_output(self.config, output, self.console):
             return output, True
         return output, False
+
+    def _parse_reduce_response(self, response: Any) -> dict[str, Any]:
+        if not isinstance(response, ModelResponse):
+            return response
+        structured_mode = (
+            self.config.get("output", {}).get("mode")
+            == OutputMode.STRUCTURED_OUTPUT.value
+        )
+        return self.runner.api.parse_llm_response(
+            response,
+            schema=self.config["output"]["schema"],
+            manually_fix_errors=self.manually_fix_errors,
+            use_structured_output=structured_mode,
+        )[0]
 
     def _increment_fold(
         self,
@@ -668,6 +787,7 @@ class ReduceOperation(BaseOperation):
         batch: list[dict],
         current_output: dict | None,
         scratchpad: str | None = None,
+        retrieval_context: str | None = None,
     ) -> tuple[dict | None, str, float]:
         """
         Perform an incremental fold operation on a batch of items.
@@ -684,7 +804,7 @@ class ReduceOperation(BaseOperation):
             the prompt used, and the cost of the fold operation.
         """
         if current_output is None:
-            return self._batch_reduce(key, batch, scratchpad)
+            return self._batch_reduce(key, batch, scratchpad, retrieval_context)
 
         start_time = time.time()
         fold_prompt = strict_render(
@@ -693,8 +813,15 @@ class ReduceOperation(BaseOperation):
                 "inputs": batch,
                 "output": current_output,
                 "reduce_key": dict(zip(self.config["reduce_key"], key)),
+                "retrieval_context": retrieval_context or "",
             },
         )
+        if retrieval_context and "retrieval_context" not in self.config.get(
+            "fold_prompt", ""
+        ):
+            fold_prompt = (
+                f"Here is some extra context:\n{retrieval_context}\n\n{fold_prompt}"
+            )
 
         response = self.runner.api.call_llm(
             self.config.get("model", self.default_model),
@@ -710,29 +837,20 @@ class ReduceOperation(BaseOperation):
                     "val_rule": self.config.get("validate", []),
                     "validation_fn": self.validation_fn,
                 }
-                if self.config.get("validate", None)
-                else None
             ),
             bypass_cache=self.config.get("bypass_cache", self.bypass_cache),
             verbose=self.config.get("verbose", False),
             litellm_completion_kwargs=self.config.get("litellm_completion_kwargs", {}),
             op_config=self.config,
+            agent_config=self.config.get("agent"),
         )
 
         end_time = time.time()
         self._update_fold_time(end_time - start_time)
+        fold_cost = response.total_cost
 
         if response.validated:
-            structured_mode = (
-                self.config.get("output", {}).get("mode")
-                == OutputMode.STRUCTURED_OUTPUT.value
-            )
-            folded_output = self.runner.api.parse_llm_response(
-                response.response,
-                schema=self.config["output"]["schema"],
-                manually_fix_errors=self.manually_fix_errors,
-                use_structured_output=structured_mode,
-            )[0]
+            folded_output = self._parse_reduce_response(response.response)
 
             folded_output.update(dict(zip(self.config["reduce_key"], key)))
             fold_cost = response.total_cost
@@ -742,7 +860,7 @@ class ReduceOperation(BaseOperation):
         return None, fold_prompt, fold_cost
 
     def _merge_results(
-        self, key: tuple, outputs: list[dict]
+        self, key: tuple, outputs: list[dict], retrieval_context: str | None = None
     ) -> tuple[dict | None, str, float]:
         """
         Merge multiple outputs into a single result.
@@ -763,8 +881,15 @@ class ReduceOperation(BaseOperation):
             {
                 "outputs": outputs,
                 "reduce_key": dict(zip(self.config["reduce_key"], key)),
+                "retrieval_context": retrieval_context or "",
             },
         )
+        if retrieval_context and "retrieval_context" not in self.config.get(
+            "merge_prompt", ""
+        ):
+            merge_prompt = (
+                f"Here is some extra context:\n{retrieval_context}\n\n{merge_prompt}"
+            )
         response = self.runner.api.call_llm(
             self.config.get("model", self.default_model),
             "merge",
@@ -785,22 +910,15 @@ class ReduceOperation(BaseOperation):
             verbose=self.config.get("verbose", False),
             litellm_completion_kwargs=self.config.get("litellm_completion_kwargs", {}),
             op_config=self.config,
+            agent_config=self.config.get("agent"),
         )
 
         end_time = time.time()
         self._update_merge_time(end_time - start_time)
+        merge_cost = response.total_cost
 
         if response.validated:
-            structured_mode = (
-                self.config.get("output", {}).get("mode")
-                == OutputMode.STRUCTURED_OUTPUT.value
-            )
-            merged_output = self.runner.api.parse_llm_response(
-                response.response,
-                schema=self.config["output"]["schema"],
-                manually_fix_errors=self.manually_fix_errors,
-                use_structured_output=structured_mode,
-            )[0]
+            merged_output = self._parse_reduce_response(response.response)
             merged_output.update(dict(zip(self.config["reduce_key"], key)))
             merge_cost = response.total_cost
             return merged_output, merge_prompt, merge_cost
@@ -858,7 +976,11 @@ class ReduceOperation(BaseOperation):
             self.merge_times.append(time)
 
     def _batch_reduce(
-        self, key: tuple, group_list: list[dict], scratchpad: str | None = None
+        self,
+        key: tuple,
+        group_list: list[dict],
+        scratchpad: str | None = None,
+        retrieval_context: str | None = None,
     ) -> tuple[dict | None, str, float]:
         """
         Perform a batch reduce operation on a group of items.
@@ -878,8 +1000,13 @@ class ReduceOperation(BaseOperation):
             {
                 "reduce_key": dict(zip(self.config["reduce_key"], key)),
                 "inputs": group_list,
+                "retrieval_context": retrieval_context or "",
             },
         )
+        if retrieval_context and "retrieval_context" not in self.config.get(
+            "prompt", ""
+        ):
+            prompt = f"Here is some extra context:\n{retrieval_context}\n\n{prompt}"
         item_cost = 0
 
         response = self.runner.api.call_llm(
@@ -904,21 +1031,13 @@ class ReduceOperation(BaseOperation):
             verbose=self.config.get("verbose", False),
             litellm_completion_kwargs=self.config.get("litellm_completion_kwargs", {}),
             op_config=self.config,
+            agent_config=self.config.get("agent"),
         )
 
         item_cost += response.total_cost
 
         if response.validated:
-            structured_mode = (
-                self.config.get("output", {}).get("mode")
-                == OutputMode.STRUCTURED_OUTPUT.value
-            )
-            output = self.runner.api.parse_llm_response(
-                response.response,
-                schema=self.config["output"]["schema"],
-                manually_fix_errors=self.manually_fix_errors,
-                use_structured_output=structured_mode,
-            )[0]
+            output = self._parse_reduce_response(response.response)
             output.update(dict(zip(self.config["reduce_key"], key)))
 
             return output, prompt, item_cost
